@@ -153,10 +153,16 @@ class SnapshotCollector:
         #     会被上一轮基线"吃掉"（基线已含该成交 → 差值 0），RTDS 按
         #     成交时间分桶记账可精确捞出整个闭合桶的成交量。
         prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
+        volume_shares = 0.0
         if self._volume_tracker is not None:
             tracked = self._volume_tracker.settle(condition_id, prev_bucket_ts)
             if tracked is not None:
                 volume_delta = tracked
+                # 份额与 USDC 同步记账（RTDS 每笔按 price 换算），settle 只取
+                # USDC，份额账本保留；price 缺失的成交不计份额
+                volume_shares = self._volume_tracker.bucket_shares(
+                    condition_id, prev_bucket_ts
+                ) or 0.0
         # 已被 RTDS 补算过的桶（volume_delta>0）不再用基线差覆盖：
         # 同一桶内连续多轮（启动轮+手动轮）时基线差会把正确值写坏
         recent2 = await self._storage.recent_snapshots(condition_id, buckets=2)
@@ -165,16 +171,18 @@ class SnapshotCollector:
         )
         if prev_row is not None and float(prev_row["volume_delta"]) > 0:
             volume_delta = 0.0
+            volume_shares = 0.0
         # 有正值增量就补算写库（RTDS 记账不依赖基线是否存在）
         if volume_delta > 0:
             await self._storage.update_snapshot_volume(
-                condition_id, prev_bucket_ts, volume_delta
+                condition_id, prev_bucket_ts, volume_delta, volume_shares
             )
             logger.info(
-                "snap prev-bucket cid=%s bucket=%s vol=%.0f",
+                "snap prev-bucket cid=%s bucket=%s vol=%.0f shares=%.0f",
                 condition_id[:8],
                 prev_bucket_ts,
                 volume_delta,
+                volume_shares,
             )
         # 当前桶刚开，本桶写入 0；闭合后由下一轮补算真实增量
         current_volume_delta = 0.0

@@ -337,6 +337,8 @@ async def amain(config_path: str) -> None:
     async def trigger_snapshot_push() -> None:
         """读取最近完整桶 → 渲染总览 → 推送到快照 Bot 白名单。"""
         now_bucket = _current_bucket_start()
+        bucket_seconds = int(snapshot_cfg.get("bucket_seconds", 7200))
+        prev_bucket_ts = now_bucket - bucket_seconds
         # 等待本桶边界的采集轮完成（该轮负责补算上一闭合桶增量），
         # 最多 120s；超时降级用旧值推送，不阻塞整点节奏。
         deadline = now_bucket + 120
@@ -358,6 +360,16 @@ async def amain(config_path: str) -> None:
                     row["current_price"] = live[cid]
         except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
             logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
+        # 上一闭合桶份额：数据库已结算值优先，内存 RTDS 记账兜底
+        prev_bucket_ts = now_bucket - bucket_seconds
+        for row in rows:
+            cid = str(row.get("condition_id") or "")
+            if not cid:
+                continue
+            shares = row.get("volume_shares")
+            if shares is None and volume_tracker is not None:
+                shares = volume_tracker.bucket_shares(cid, prev_bucket_ts)
+            row["volume_shares_display"] = float(shares or 0.0)
         alert = render_snapshot_summary(
             rows,
             tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),

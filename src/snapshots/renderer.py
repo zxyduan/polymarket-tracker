@@ -20,6 +20,13 @@ def _fmt_volume(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+def _fmt_shares(value: float | None) -> str:
+    """份额显示：0 = 真实零成交显示 0；无数据显示 -。"""
+    if value is None:
+        return "-"
+    return f"{value:,.0f}"
+
+
 def _fmt_pct(value: float | None) -> str:
     if value is None:
         return ""
@@ -80,12 +87,13 @@ def render_snapshot_summary(
         regime = REGIME_CN.get(str(row.get("vol_regime") or ""), "-")
         amp = _bucket_amplitude(row)
         amp_s = f"{amp:.1f}%" if amp is not None else "-"
-        volume = _fmt_volume(row.get("volume_delta"))
+        volume = _fmt_shares(row.get("volume_shares_display"))
+        volume_usdc = _fmt_volume(row.get("volume_delta"))
         current = row.get("current_price")
         price = _fmt_price(current if current is not None else row.get("price_close"))
         line = (
-            f"{i}️⃣ {_market_label(row)}：量 {volume} ｜ 波动 {regime}·{amp_s} "
-            f"｜ 现价 {price} {icon}{trend_pct}"
+            f"{i}️⃣ {_market_label(row)}：量 {volume} 份（{volume_usdc}）"
+            f" ｜ 波动 {regime}·{amp_s} ｜ 现价 {price} {icon}{trend_pct}"
         ).rstrip()
         lines.append(line)
 
@@ -104,26 +112,47 @@ def render_market_list(markets: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_shares(value: float | None) -> str:
+    """份额显示：0 = 真实零成交显示 0；无数据显示 -。"""
+    if value is None:
+        return "-"
+    return f"{value:,.0f}"
+
+
 async def render_tracker_status(storage: Any, tracker: Any | None) -> str:
-    """RTDS 记账实时状态（/vol 指令）：每个市场当前桶 + 上一闭合桶的
-    tracker 累计成交额。值 >0 说明 RTDS 成交流正在实时记账。"""
+    """RTDS 记账实时状态（/vol 指令）：每个市场「当前桶｜上一闭合桶」，
+    双口径：份额（主）+ USDC（辅，用于与 Gamma volumeNum 对账）。
+
+    - 当前桶：内存实时累计（RTDS 逐笔记账，会一直涨）
+    - 上一闭合桶：优先数据库已结算值（volume_delta/volume_shares），
+      内存值被采集器 settle 取走写库后不再显示 0，避免误读。
+    """
     now_bucket = (int(time.time()) // BUCKET_SIZE_SEC) * BUCKET_SIZE_SEC
+    prev_bucket = now_bucket - BUCKET_SIZE_SEC
     rows = await storage.latest_complete_buckets(now_bucket)
     if not rows:
         return "<b>RTDS 记账状态</b>\n暂无快照数据（先跑一轮采集）"
     lines = [
         "<b>RTDS 记账状态</b>",
-        "格式：市场｜当前桶 USDC｜上一闭合桶 USDC",
+        "格式：市场｜当前桶(份额/USDC)｜上一闭合桶(份额/USDC)",
     ]
     for r in rows:
         cid = str(r.get("condition_id") or "")
         slug_id = html_escape(str(r.get("slug_id") or r.get("slug") or "?"))
-        if not cid or tracker is None:
-            cur = prev = None
+        # 当前桶：内存实时值（份额 + USDC）
+        cur_sh = tracker.bucket_shares(cid, now_bucket) if cid and tracker else None
+        cur_us = tracker.bucket_volume(cid, now_bucket) if cid and tracker else None
+        # 上一闭合桶：数据库已结算值优先，内存份额兜底
+        prev_sh = r.get("volume_shares")
+        if prev_sh is None and cid and tracker:
+            prev_sh = tracker.bucket_shares(cid, prev_bucket)
+        prev_us = r.get("volume_delta")
+        cur_s = f"{cur_sh:,.0f}/{cur_us:,.0f}" if cur_sh else "0/0"
+        if cur_sh is None and cur_us:
+            cur_s = f"-/{cur_us:,.0f}"
+        if prev_sh:
+            prev_s = f"{prev_sh:,.0f}/{prev_us:,.0f}" if prev_us else f"{prev_sh:,.0f}/-"
         else:
-            cur = tracker.bucket_volume(cid, now_bucket)
-            prev = tracker.bucket_volume(cid, now_bucket - BUCKET_SIZE_SEC)
-        cur_s = f"{cur:,.0f}" if cur else "0"
-        prev_s = f"{prev:,.0f}" if prev else "0"
+            prev_s = f"-/{prev_us:,.0f}" if prev_us else "0/0"
         lines.append(f"{slug_id}｜{cur_s}｜{prev_s}")
     return "\n".join(lines)

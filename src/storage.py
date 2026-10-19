@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     price_high        REAL NOT NULL,
     price_low         REAL NOT NULL,
     volume_delta      REAL NOT NULL DEFAULT 0.0,
+    volume_shares     REAL NOT NULL DEFAULT 0.0,
     trend             TEXT NOT NULL DEFAULT '',
     trend_pct         REAL NOT NULL DEFAULT 0.0,
     trend_streak      INTEGER NOT NULL DEFAULT 0,
@@ -116,6 +117,13 @@ class Storage:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await asyncio.to_thread(self._connect)
         await self._execute_script(SCHEMA)
+        # 旧库迁移：market_snapshots 补 volume_shares 列（新库 SCHEMA 已含）
+        try:
+            await self._execute(
+                "ALTER TABLE market_snapshots ADD COLUMN volume_shares REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass  # 列已存在
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -381,6 +389,7 @@ class Storage:
         price_high: float,
         price_low: float,
         volume_delta: float,
+        volume_shares: float = 0.0,
         trend: str,
         trend_pct: float,
         trend_streak: int,
@@ -402,17 +411,18 @@ class Storage:
             """INSERT INTO market_snapshots (
                 condition_id, slug, slug_id, bucket_ts,
                 price_open, price_close, price_high, price_low,
-                volume_delta, trend, trend_pct, trend_streak, trend_direction,
+                volume_delta, volume_shares, trend, trend_pct, trend_streak, trend_direction,
                 drawdown_from_high, price_percentile,
                 bid_depth_top5, ask_depth_top5, bid_wall_count, bid_depth_change,
                 vol_short, vol_long, vol_regime,
                 our_fv, market_fv, collected_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(condition_id, bucket_ts) DO UPDATE SET
                 slug=excluded.slug, slug_id=excluded.slug_id,
                 price_open=excluded.price_open, price_close=excluded.price_close,
                 price_high=excluded.price_high, price_low=excluded.price_low,
                 volume_delta=excluded.volume_delta,
+                volume_shares=excluded.volume_shares,
                 trend=excluded.trend, trend_pct=excluded.trend_pct,
                 trend_streak=excluded.trend_streak, trend_direction=excluded.trend_direction,
                 drawdown_from_high=excluded.drawdown_from_high,
@@ -428,7 +438,7 @@ class Storage:
             (
                 condition_id, slug, slug_id, bucket_ts,
                 price_open, price_close, price_high, price_low,
-                volume_delta, trend, trend_pct, trend_streak, trend_direction,
+                volume_delta, volume_shares, trend, trend_pct, trend_streak, trend_direction,
                 drawdown_from_high, price_percentile,
                 bid_depth_top5, ask_depth_top5, bid_wall_count, bid_depth_change,
                 vol_short, vol_long, vol_regime,
@@ -446,17 +456,18 @@ class Storage:
         return dict(row) if row else None
 
     async def update_snapshot_volume(
-        self, condition_id: str, bucket_ts: int, volume_delta: float
+        self, condition_id: str, bucket_ts: int, volume_delta: float,
+        volume_shares: float = 0.0,
     ) -> None:
-        """更新指定（已闭合）桶的成交量增量；桶不存在则忽略（幂等）。
+        """更新指定（已闭合）桶的成交量增量（USDC + 份额）；桶不存在则忽略（幂等）。
 
         桶闭合时其 volume_delta 尚为 0（采集时桶刚开），由下一轮采集
-        （或推送前）用累计量差值补算后写回，保证"最新成交量"可读。
+        （或推送前）用 RTDS 记账补算后写回，保证"最新成交量"可读。
         """
         await self._execute(
-            "UPDATE market_snapshots SET volume_delta=?, collected_ts=? "
+            "UPDATE market_snapshots SET volume_delta=?, volume_shares=?, collected_ts=? "
             "WHERE condition_id=? AND bucket_ts=?",
-            (volume_delta, time.time(), condition_id, bucket_ts),
+            (volume_delta, volume_shares, time.time(), condition_id, bucket_ts),
         )
 
     async def recent_snapshots(

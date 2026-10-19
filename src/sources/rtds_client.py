@@ -120,7 +120,10 @@ class RtdsClient:
                     ):
                         try:
                             self._volume_tracker.record(
-                                event.condition_id, event.notional, event.event_time
+                                event.condition_id,
+                                event.notional,
+                                event.event_time,
+                                event.price,
                             )
                         except Exception as exc:  # noqa: BLE001 - 记账失败不影响交易员监控
                             logger.warning("snap volume record failed: %s", exc)
