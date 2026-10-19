@@ -125,8 +125,13 @@ def build_trade(raw: dict[str, Any], source: str) -> StandardEvent | None:
     price = to_decimal(first_key(raw, *_PRICE_KEYS))
     size = to_decimal(first_key(raw, *_SIZE_KEYS))
     notional = to_decimal(first_key(raw, *_NOTIONAL_KEYS))
-    if notional is None and price is not None and size is not None:
-        notional = price * size
+    if notional is None and size is not None:
+        # RTDS activity 成交：size 即成交额（USDC），非份额数
+        # （官方口径 size: notional in USDC；实测连续成交 size 均为整数美元）
+        if source == "rtds":
+            notional = size
+        elif price is not None:
+            notional = price * size
 
     tx = first_key(raw, *_TX_KEYS)
     tx = str(tx) if tx else None

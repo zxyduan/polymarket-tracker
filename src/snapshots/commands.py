@@ -5,13 +5,14 @@ from __future__ import annotations
 import time
 from typing import Any, Awaitable, Callable
 
-from src.snapshots.renderer import render_market_list
+from src.snapshots.renderer import render_market_list, render_tracker_status
 
 SNAP_HELP = (
     "<b>市场快照推送</b>\n"
     "每 2 小时采集自选市场，北京时间 06/09/12/15/18/20/24 推送总览\n"
     "支持指令：\n"
     "/snap now — 立即采集一轮并推送\n"
+    "/vol — RTDS 成交量记账实时状态\n"
     "/list — 查看监控市场\n"
     "/status — 查看快照服务状态\n"
     "/help — 帮助"
@@ -28,12 +29,14 @@ class SnapshotCommandHandler:
         storage: Any,
         trigger_snapshot: Callable[[], Awaitable[None]],
         health: dict[str, Any],
+        volume_tracker: Any | None = None,
     ) -> None:
         self.markets = markets
         self.collector = collector
         self.storage = storage
         self.trigger_snapshot = trigger_snapshot
         self.health = health
+        self.volume_tracker = volume_tracker
 
     async def __call__(self, text: str, chat_id: int) -> str | None:
         parts = text.strip().split()
@@ -47,6 +50,8 @@ class SnapshotCommandHandler:
             return render_market_list(self.markets)
         if command == "/snap":
             return await self._snap_now()
+        if command == "/vol":
+            return await render_tracker_status(self.storage, self.volume_tracker)
         if command == "/status":
             return await self._status()
         return "未识别指令，发送 /help 查看可用指令"

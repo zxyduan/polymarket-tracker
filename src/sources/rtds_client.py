@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import websockets
 
-from src.core.models import StandardEvent
+from src.core.models import StandardEvent, TRADE
 from src.core.parsing import parse_rtds_message
 from src.utils.retry import backoff_delay
 
@@ -37,12 +37,15 @@ class RtdsClient:
         heartbeat_seconds: int = 15,
         reconnect_min_seconds: float = 1.0,
         reconnect_max_seconds: float = 30.0,
+        volume_tracker: Any | None = None,
     ) -> None:
         self.url = url
         self.heartbeat_seconds = heartbeat_seconds
         self.reconnect_min = reconnect_min_seconds
         self.reconnect_max = reconnect_max_seconds
         self.connected = False
+        # 快照成交量累加器：全量成交先记账，再按钱包过滤（供快照闭合桶补算）
+        self._volume_tracker = volume_tracker
 
     async def run(
         self,
@@ -108,5 +111,18 @@ class RtdsClient:
                     continue
 
                 for event in parse_rtds_message(data):
+                    # 快照成交量记账：全量成交（含非监控钱包）按桶累计，
+                    # 供快照采集器补算上一闭合桶的真实成交量增量。
+                    # 记账是附属功能，异常必须隔离，绝不能拖垮 RTDS 主链路。
+                    if (
+                        self._volume_tracker is not None
+                        and event.event_type == TRADE
+                    ):
+                        try:
+                            self._volume_tracker.record(
+                                event.condition_id, event.notional, event.event_time
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 记账失败不影响交易员监控
+                            logger.warning("snap volume record failed: %s", exc)
                     if event.wallet in watched:
                         event_queue.put_nowait(event)

@@ -27,6 +27,7 @@ from src.snapshots.collector import (
 )
 from src.snapshots.commands import SnapshotCommandHandler
 from src.snapshots.renderer import render_snapshot_summary
+from src.snapshots.volume_tracker import VolumeTracker
 from src.sources.data_api_client import DataApiClient
 from src.sources.gamma_client import GammaClient
 from src.sources.rtds_client import RtdsClient
@@ -266,12 +267,16 @@ async def amain(config_path: str) -> None:
     endpoints = settings.section("endpoints")
     polling = settings.section("polling")
 
+    # 快照成交量累加器：RTDS 全量成交按桶记账，供快照闭合桶补算精确增量
+    volume_tracker = VolumeTracker()
+
     # 客户端
     rtds = RtdsClient(
         str(endpoints.get("rtds")),
         heartbeat_seconds=int(polling.get("rtds_heartbeat_seconds", 15)),
         reconnect_min_seconds=float(polling.get("reconnect_min_seconds", 1)),
         reconnect_max_seconds=float(polling.get("reconnect_max_seconds", 30)),
+        volume_tracker=volume_tracker,
     )
     data_api = DataApiClient(
         str(endpoints.get("data_api")),
@@ -321,6 +326,7 @@ async def amain(config_path: str) -> None:
         clob_host=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
         timeout=float(snapshot_cfg.get("request_timeout_seconds", 15)),
         price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
+        volume_tracker=volume_tracker,
     )
     snap_health: dict[str, Any] = {"snap_last_push": "-"}
     snap_auth: AuthManager | None = None
@@ -343,6 +349,15 @@ async def amain(config_path: str) -> None:
         if not rows:
             logger.info("快照推送跳过：暂无完整桶数据")
             return
+        # 推送前实时取各市场当前盘面价（失败降级用闭合桶收盘价）
+        try:
+            live = await snap_collector.fetch_live_prices(rows)
+            for row in rows:
+                cid = str(row.get("condition_id") or "")
+                if cid in live:
+                    row["current_price"] = live[cid]
+        except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
+            logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
         alert = render_snapshot_summary(
             rows,
             tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
@@ -452,6 +467,7 @@ async def amain(config_path: str) -> None:
             storage,
             trigger_snapshot_now,
             snap_health,
+            volume_tracker=volume_tracker,
         )
         tasks.append(
             asyncio.create_task(

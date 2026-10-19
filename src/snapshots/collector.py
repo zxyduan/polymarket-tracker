@@ -1,13 +1,19 @@
-"""2 小时粒度市场快照采集器（算法口径对齐 poly-maker_mini catalog/snapshots.py）。
+"""2 小时粒度市场快照采集器。
 
 数据来源：
-  - Gamma /markets          → 累计成交量 volumeNum
+  - Gamma /markets          → 累计成交量 volumeNum（基线差兜底）
+  - RTDS 全量成交流          → 每笔成交按桶记账（精确成交量增量，主来源）
   - CLOB /prices-history    → 历史价格序列，按 2h 桶聚合 OHLC
   - CLOB /book              → 订单簿快照，前 5 档深度 + 墙数量
+
+说明：CLOB /trades 逐笔接口已要求 API key（2026 起），故成交量增量
+主来源改为 RTDS activity 全量成交记账（VolumeTracker），无需认证、
+精确到桶边界；Gamma volumeNum 基线差仅作兜底。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
@@ -59,12 +65,14 @@ class SnapshotCollector:
         clob_host: str = "https://clob.polymarket.com",
         timeout: float = 15.0,
         price_fidelity_minutes: int = 60,
+        volume_tracker: Any | None = None,
     ) -> None:
         self._storage = storage
         self._gamma = httpx.AsyncClient(base_url=gamma_host, timeout=timeout)
         self._clob = httpx.AsyncClient(base_url=clob_host, timeout=timeout)
         self._fidelity = price_fidelity_minutes
         self._resolved: dict[str, tuple[str, str]] = {}
+        self._volume_tracker = volume_tracker
 
     async def aclose(self) -> None:
         await self._gamma.aclose()
@@ -140,11 +148,25 @@ class SnapshotCollector:
         prev_vol = await self._storage.get_snap_baseline(condition_id)
         volume_delta = _calc_volume_delta(cum_volume, prev_vol)
 
-        # 2b. 补算上一闭合桶：基线 = 上轮边界采集时的累计量，本轮累计量与其差值
-        #     即该桶闭合后的全桶成交量。当前桶刚开时 delta≈0，闭合后靠这里补算，
-        #     否则整点推送读"最近完整桶"时量永远≈0。
+        # 2b. 补算上一闭合桶：RTDS 全量成交记账优先（精确、实时、无需认证）。
+        #     低频市场 1-2h 才一笔，成交常发生在两轮采集之间，Gamma 基线差
+        #     会被上一轮基线"吃掉"（基线已含该成交 → 差值 0），RTDS 按
+        #     成交时间分桶记账可精确捞出整个闭合桶的成交量。
         prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
-        if prev_vol is not None and volume_delta > 0:
+        if self._volume_tracker is not None:
+            tracked = self._volume_tracker.settle(condition_id, prev_bucket_ts)
+            if tracked is not None:
+                volume_delta = tracked
+        # 已被 RTDS 补算过的桶（volume_delta>0）不再用基线差覆盖：
+        # 同一桶内连续多轮（启动轮+手动轮）时基线差会把正确值写坏
+        recent2 = await self._storage.recent_snapshots(condition_id, buckets=2)
+        prev_row = next(
+            (r for r in recent2 if int(r["bucket_ts"]) == prev_bucket_ts), None
+        )
+        if prev_row is not None and float(prev_row["volume_delta"]) > 0:
+            volume_delta = 0.0
+        # 有正值增量就补算写库（RTDS 记账不依赖基线是否存在）
+        if volume_delta > 0:
             await self._storage.update_snapshot_volume(
                 condition_id, prev_bucket_ts, volume_delta
             )
@@ -285,6 +307,36 @@ class SnapshotCollector:
         return count
 
     # ── fetcher ──────────────────────────────────────────────────────
+
+    async def fetch_live_prices(self, rows: list[dict[str, Any]]) -> dict[str, float]:
+        """推送前取每个市场 Gamma 最新价 → {condition_id: price}。
+
+        失败的市场降级跳过（渲染时回退 price_close）；单市场超时/报错
+        不拖垮整次推送，逐个并发拉取。
+        """
+        cids = [str(r.get("condition_id") or "") for r in rows if r.get("condition_id")]
+        if not cids:
+            return {}
+
+        async def _one(cid: str) -> tuple[str, float | None]:
+            try:
+                r = await self._gamma.get(
+                    "/markets", params={"condition_ids": cid, "limit": 1}
+                )
+                r.raise_for_status()
+                data = r.json()
+                if not data:
+                    return (cid, None)
+                price = data[0].get("price")
+                if price is None:
+                    return (cid, None)
+                return (cid, float(price))
+            except Exception as exc:  # noqa: BLE001 - 单市场失败降级
+                logger.warning("snap_live_price_failed cid=%s err=%s", cid[:8], exc)
+                return (cid, None)
+
+        results = await asyncio.gather(*(_one(c) for c in cids))
+        return {cid: price for cid, price in results if price is not None}
 
     async def _fetch_cumulative_volume(self, condition_id: str) -> float | None:
         try:
