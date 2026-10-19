@@ -1,0 +1,22 @@
+# 密钥与真实配置（绝不上传）
+.env
+config/config.yaml
+config/markets.toml
+
+# 运行时数据
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 部署临时文件
+*.zip
+*.bak.*
+docs/

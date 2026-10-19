@@ -1,0 +1,16 @@
+# 市场快照监控列表（自选市场，TOML [[markets]] 数组）
+# - slug_id：推送消息中显示的市场短码（仅展示用，唯一性以 condition_id 为准）
+# - slug：Polymarket 市场完整 slug（启动时解析 condition_id；也可直接填 condition_id 跳过解析）
+# - condition_id：可选，留空则按 slug 解析
+# - enabled：false 则跳过该市场
+# - profile / fv_initial / fv_start_date / fv_end_date：预留字段，本期不消费
+
+[[markets]]
+slug_id       = "kkkkkkk"
+slug          = "clarity-act-signed-into-law-in-2026"
+condition_id  = ""
+enabled       = true
+profile       = "one_way"
+fv_initial    = 0.05
+fv_start_date = ""
+fv_end_date   = ""
