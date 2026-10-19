@@ -129,6 +129,10 @@ class SnapshotCollector:
         fv_end_date: str = "",
     ) -> None:
         """跑一次完整采集：新市场回填 → 拉数据 → 算特征 → 写入 → 清理。"""
+        # 0a. 把本市场加入 RTDS 记账白名单（/add 后首轮采集即生效；
+        #     已在白名单则幂等），避免全市场记账导致内存无界增长
+        if self._volume_tracker is not None:
+            self._volume_tracker.add_tracked_cid(condition_id)
         # 0. 新市场自动回填历史（库里没有任何桶才跑）
         existing = await self._storage.recent_snapshots(condition_id, buckets=1)
         if not existing:
@@ -154,7 +158,18 @@ class SnapshotCollector:
         #     成交时间分桶记账可精确捞出整个闭合桶的成交量。
         prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
         volume_shares = 0.0
-        if self._volume_tracker is not None:
+        # 已被 RTDS 补算过的桶（volume_delta>0）不再用基线差覆盖：
+        # 同一桶内连续多轮（启动轮+手动轮）时基线差会把正确值写坏。
+        # 必须先判断再 settle：若桶已有值，跳过 settle（不 pop），否则
+        # RTDS 精确值会被取走丢弃且不写库（数据永久丢失）。
+        recent2 = await self._storage.recent_snapshots(condition_id, buckets=2)
+        prev_row = next(
+            (r for r in recent2 if int(r["bucket_ts"]) == prev_bucket_ts), None
+        )
+        prev_has_value = prev_row is not None and float(prev_row["volume_delta"]) > 0
+        if prev_has_value:
+            volume_delta = 0.0
+        elif self._volume_tracker is not None:
             tracked = self._volume_tracker.settle(condition_id, prev_bucket_ts)
             if tracked is not None:
                 volume_delta = tracked
@@ -163,15 +178,6 @@ class SnapshotCollector:
                 volume_shares = self._volume_tracker.bucket_shares(
                     condition_id, prev_bucket_ts
                 ) or 0.0
-        # 已被 RTDS 补算过的桶（volume_delta>0）不再用基线差覆盖：
-        # 同一桶内连续多轮（启动轮+手动轮）时基线差会把正确值写坏
-        recent2 = await self._storage.recent_snapshots(condition_id, buckets=2)
-        prev_row = next(
-            (r for r in recent2 if int(r["bucket_ts"]) == prev_bucket_ts), None
-        )
-        if prev_row is not None and float(prev_row["volume_delta"]) > 0:
-            volume_delta = 0.0
-            volume_shares = 0.0
         # 有正值增量就补算写库（RTDS 记账不依赖基线是否存在）
         if volume_delta > 0:
             await self._storage.update_snapshot_volume(

@@ -64,6 +64,46 @@ def load_markets_toml(path: str | Path) -> list[MarketEntry]:
     return entries
 
 
+def save_markets_toml(path: str | Path, entries: list[MarketEntry]) -> None:
+    """把市场列表整体写回 markets.toml（/add /remove 落盘用）。
+
+    保留原始头部注释，仅重写 [[markets]] 数组；字段全部序列化，
+    避免下次 load 丢字段。写前先备份 .bak，防异常中断丢配置。
+    """
+    p = Path(path)
+    header: list[str] = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("[[markets]]"):
+                break
+            header.append(line)
+    backup = p.with_suffix(p.suffix + ".bak")
+    if p.exists():
+        backup.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+
+    lines = list(header)
+    while lines and not lines[-1].strip():
+        lines.pop()  # 去掉头部末尾空行，统一格式
+    lines.append("")
+    for m in entries:
+        lines.append("[[markets]]")
+        lines.append(f'slug_id       = "{_toml_escape(m.slug_id)}"')
+        lines.append(f'slug          = "{_toml_escape(m.slug)}"')
+        lines.append(f'condition_id  = "{_toml_escape(m.condition_id)}"')
+        lines.append(f"enabled       = {str(bool(m.enabled)).lower()}")
+        lines.append(f'profile       = "{_toml_escape(m.profile)}"')
+        lines.append(f"fv_initial    = {m.fv_initial:.6g}")
+        lines.append(f'fv_start_date = "{_toml_escape(m.fv_start_date)}"')
+        lines.append(f'fv_end_date   = "{_toml_escape(m.fv_end_date)}"')
+        lines.append("")
+    p.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _toml_escape(value: str) -> str:
+    """TOML 基础字符串转义（反斜杠与双引号）。"""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 @dataclass
 class Settings:
     """运行期配置（环境变量 + config.yaml）。"""

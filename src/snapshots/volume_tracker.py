@@ -1,10 +1,14 @@
 """RTDS 全量成交成交量累加器。
 
 Polymarket 的 RTDS activity 流是"全市场"成交广播（客户端按钱包过滤），
-快照市场并非交易员地址，原本会被过滤丢弃。本模块在过滤之前先把每一笔
-成交按 (condition_id, 2h 桶) 记账（USDC 成交额 + 份额双账本），供快照
-采集器补算闭合桶的真实成交量增量——精确到桶边界、实时、无需 API key，
+快照市场并非交易员地址，原本会被过滤丢弃。本模块在过滤之前先把**白名单
+市场**的每一笔成交按 (condition_id, 2h 桶) 记账（USDC 成交额 + 份额双账本），
+供快照采集器补算闭合桶的真实成交量增量——精确到桶边界、实时、无需 API key，
 不受 Gamma volumeNum 缓存延迟与采集间隔影响。
+
+白名单（tracked cids）机制同时解决两个问题：
+1. 全市场记账导致内存无界增长（非快照市场的桶永远不会被 settle）；
+2. 只记自选市场，配合 /add /remove 动态盘口管理。
 """
 
 from __future__ import annotations
@@ -23,13 +27,39 @@ def bucket_of(ts: float) -> int:
 class VolumeTracker:
     """内存账本：{(condition_id, bucket_ts): (成交额 USDC, 份额)}。
 
-    单事件循环内使用，无需加锁；settle 取走 USDC 即删（写库后防重复），
-    份额账本保留供渲染/对比（桶闭合后不再有新成交进入该桶）。
+    只记录白名单市场的成交；单事件循环内使用，无需加锁。
+    settle 取走 USDC 即删（写库后防重复），份额账本保留供渲染/对比
+    （桶闭合后不再有新成交进入该桶）。
     """
 
     def __init__(self) -> None:
         self._volumes: dict[tuple[str, int], float] = {}
         self._shares: dict[tuple[str, int], float] = {}
+        self._tracked: set[str] = set()
+
+    def set_tracked_cids(self, cids: set[str]) -> None:
+        """整体设置白名单，并清掉已不在白名单市场的旧记账（释放内存）。"""
+        self._tracked = {c.lower() for c in cids if c}
+        self._volumes = {
+            k: v for k, v in self._volumes.items() if k[0] in self._tracked
+        }
+        self._shares = {
+            k: v for k, v in self._shares.items() if k[0] in self._tracked
+        }
+
+    def add_tracked_cid(self, condition_id: str | None) -> None:
+        """动态加入一个市场（/add 或采集解析成功后调用）。"""
+        if condition_id:
+            self._tracked.add(condition_id.lower())
+
+    def remove_tracked_cid(self, condition_id: str | None) -> None:
+        """动态移除一个市场（/remove 后调用），并清掉其旧记账。"""
+        if not condition_id:
+            return
+        cid = condition_id.lower()
+        self._tracked.discard(cid)
+        self._volumes = {k: v for k, v in self._volumes.items() if k[0] != cid}
+        self._shares = {k: v for k, v in self._shares.items() if k[0] != cid}
 
     def record(
         self,
@@ -38,13 +68,17 @@ class VolumeTracker:
         ts: float | None = None,
         price: float | None = None,
     ) -> None:
-        """记一笔成交到其所属桶（USDC 成交额 + 份额）。
+        """记一笔白名单市场的成交到其所属桶（USDC 成交额 + 份额）。
 
-        RTDS 口径：size 是份额；成交额 notional = price × size；份额账本 = notional / price = size。
+        RTDS 口径：size 是份额，成交额 notional = price × size（parsing 层
+        已换算）；份额账本 = notional / price = size。非白名单市场直接忽略
+        （RTDS 是全市场广播，不记则内存有界）。
         condition_id 缺失、金额非正或时间非法时静默忽略。
         notional/price 可能是 Decimal（StandardEvent 口径），统一转 float。
         """
         if not condition_id or notional is None:
+            return
+        if condition_id.lower() not in self._tracked:
             return
         try:
             total = float(notional)

@@ -267,7 +267,8 @@ async def amain(config_path: str) -> None:
     endpoints = settings.section("endpoints")
     polling = settings.section("polling")
 
-    # 快照成交量累加器：RTDS 全量成交按桶记账，供快照闭合桶补算精确增量
+    # 快照成交量累加器：RTDS 白名单市场成交按桶记账，供快照闭合桶补算精确增量。
+    # 白名单在 markets 定义后初始化（见下方 set_tracked_cids 调用）。
     volume_tracker = VolumeTracker()
 
     # 客户端
@@ -320,6 +321,14 @@ async def amain(config_path: str) -> None:
         logger.info("快照市场 %d 个: %s", len(markets), [m.slug_id for m in markets])
     else:
         logger.info("快照市场为空（config/markets.toml 未配置），仅注册推送循环")
+    # RTDS 记账白名单：配置显式 cid + 快照表历史出现过的 cid
+    # （resolve 出的 cid 由 collector.collect 自动补入；/add /remove 动态增减）。
+    # 只记自选市场 → 内存有界，不会随全市场成交流无限增长。
+    if markets:
+        known_cids = {
+            m.condition_id for m in markets if m.condition_id
+        } | set(await storage.distinct_snapshot_cids())
+        volume_tracker.set_tracked_cids(known_cids)
     snap_collector = SnapshotCollector(
         storage,
         gamma_host=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
@@ -361,7 +370,6 @@ async def amain(config_path: str) -> None:
         except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
             logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
         # 上一闭合桶份额：数据库已结算值优先，内存 RTDS 记账兜底
-        prev_bucket_ts = now_bucket - bucket_seconds
         for row in rows:
             cid = str(row.get("condition_id") or "")
             if not cid:
@@ -480,6 +488,7 @@ async def amain(config_path: str) -> None:
             trigger_snapshot_now,
             snap_health,
             volume_tracker=volume_tracker,
+            markets_path=str(settings.config_path.parent / "markets.toml"),
         )
         tasks.append(
             asyncio.create_task(

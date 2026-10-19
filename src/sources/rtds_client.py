@@ -110,13 +110,18 @@ class RtdsClient:
                     logger.debug("RTDS 非 JSON 消息，已忽略: %.80s", text)
                     continue
 
+                msg_type = str(data.get("type", "")).strip().lower() if isinstance(data, dict) else ""
                 for event in parse_rtds_message(data):
-                    # 快照成交量记账：全量成交（含非监控钱包）按桶累计，
-                    # 供快照采集器补算上一闭合桶的真实成交量增量。
+                    # 快照成交量记账：只认 activity/trades 消息（权威成交流），
+                    # 按桶累计供快照采集器补算上一闭合桶的真实成交量增量。
+                    # orders_matched 消息与 trades 对同一笔撮合都会广播，若也
+                    # 记账会把成交额重复累计（虚高），故记账排除该 topic；
+                    # 钱包监控仍保留两种（maker/taker 全覆盖）。
                     # 记账是附属功能，异常必须隔离，绝不能拖垮 RTDS 主链路。
                     if (
                         self._volume_tracker is not None
                         and event.event_type == TRADE
+                        and msg_type == "trades"
                     ):
                         try:
                             self._volume_tracker.record(

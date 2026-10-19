@@ -480,6 +480,13 @@ class Storage:
         )
         return [dict(row) for row in rows]
 
+    async def distinct_snapshot_cids(self) -> list[str]:
+        """取快照表出现过的全部 condition_id（RTDS 记账白名单恢复用）。"""
+        rows = await self._fetchall(
+            "SELECT DISTINCT condition_id FROM market_snapshots WHERE condition_id != ''"
+        )
+        return [str(row["condition_id"]) for row in rows]
+
     async def latest_complete_buckets(
         self, now_bucket: int
     ) -> list[dict[str, Any]]:
