@@ -133,4 +133,9 @@ class RtdsClient:
                         except Exception as exc:  # noqa: BLE001 - 记账失败不影响交易员监控
                             logger.warning("snap volume record failed: %s", exc)
                     if event.wallet in watched:
-                        event_queue.put_nowait(event)
+                        try:
+                            event_queue.put_nowait(event)
+                        except asyncio.QueueFull:
+                            # 队列满（消费者积压）：等待腾出空间再入队，
+                            # 避免抛异常触发 WS 重连（重连会丢订阅与断连期消息）。
+                            await event_queue.put(event)

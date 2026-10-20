@@ -372,7 +372,7 @@ class Storage:
             datetime.now(timezone.utc).timestamp() - retention_days * 86400
         )
         await self._execute(
-            "DELETE FROM events WHERE event_time IS NOT NULL AND "
+            "DELETE FROM events WHERE event_time IS NULL OR "
             "strftime('%s', event_time) < ?",
             (str(cutoff),),
         )

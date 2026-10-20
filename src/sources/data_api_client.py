@@ -110,7 +110,12 @@ class DataApiClient:
                 logger.warning("地址对账失败: %s", result)
                 continue
             for event in result:
-                event_queue.put_nowait(event)
+                try:
+                    event_queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    # 队列满：等待消费者腾出空间（不丢弃交易事件），
+                    # 避免抛异常导致整轮对账被跳过。
+                    await event_queue.put(event)
                 new_count += 1
         await storage.set_state(
             "l2_last_run",
