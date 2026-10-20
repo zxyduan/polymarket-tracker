@@ -91,9 +91,11 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
 CREATE INDEX IF NOT EXISTS idx_snap_time ON market_snapshots(bucket_ts);
 
 CREATE TABLE IF NOT EXISTS snap_volume_baseline (
-    condition_id TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL,
+    bucket_ts    INTEGER NOT NULL,
     value        REAL NOT NULL,
-    updated_ts   REAL NOT NULL
+    updated_ts   REAL NOT NULL,
+    PRIMARY KEY (condition_id, bucket_ts)
 );
 """
 
@@ -124,6 +126,16 @@ class Storage:
             )
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # 旧库迁移（v10）：snap_volume_baseline 改为按桶存储（重启不丢基线），
+        # 旧表无 bucket_ts 列则重建（基线是临时采样值，可重建，无历史价值）。
+        try:
+            cols = await self._fetchall("PRAGMA table_info(snap_volume_baseline)")
+        except sqlite3.OperationalError:
+            cols = []
+        if cols and not any(r["name"] == "bucket_ts" for r in cols):
+            await self._execute("DROP TABLE snap_volume_baseline")
+            await self._execute_script(SCHEMA)
+            logger.info("snap_volume_baseline 已迁移为按桶结构（v10）")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -436,7 +448,7 @@ class Storage:
                 our_fv=excluded.our_fv, market_fv=excluded.market_fv,
                 collected_ts=excluded.collected_ts""",
             (
-                condition_id, slug, slug_id, bucket_ts,
+                condition_id.lower(), slug, slug_id, bucket_ts,
                 price_open, price_close, price_high, price_low,
                 volume_delta, volume_shares, trend, trend_pct, trend_streak, trend_direction,
                 drawdown_from_high, price_percentile,
@@ -451,7 +463,7 @@ class Storage:
         row = await self._fetchone(
             "SELECT * FROM market_snapshots WHERE condition_id=? "
             "ORDER BY bucket_ts DESC LIMIT 1",
-            (condition_id,),
+            (condition_id.lower(),),
         )
         return dict(row) if row else None
 
@@ -467,7 +479,7 @@ class Storage:
         await self._execute(
             "UPDATE market_snapshots SET volume_delta=?, volume_shares=?, collected_ts=? "
             "WHERE condition_id=? AND bucket_ts=?",
-            (volume_delta, volume_shares, time.time(), condition_id, bucket_ts),
+            (volume_delta, volume_shares, time.time(), condition_id.lower(), bucket_ts),
         )
 
     async def recent_snapshots(
@@ -476,7 +488,7 @@ class Storage:
         rows = await self._fetchall(
             "SELECT * FROM market_snapshots WHERE condition_id=? "
             "ORDER BY bucket_ts DESC LIMIT ?",
-            (condition_id, buckets),
+            (condition_id.lower(), buckets),
         )
         return [dict(row) for row in rows]
 
@@ -505,19 +517,21 @@ class Storage:
         )
         return [dict(row) for row in rows]
 
-    async def get_snap_baseline(self, condition_id: str) -> float | None:
+    async def get_snap_baseline(self, condition_id: str, bucket_ts: int) -> float | None:
+        """取某市场指定桶**起点时刻**的 Gamma 累计量（桶内成交的差值基线）。"""
         row = await self._fetchone(
-            "SELECT value FROM snap_volume_baseline WHERE condition_id=?",
-            (condition_id,),
+            "SELECT value FROM snap_volume_baseline WHERE condition_id=? AND bucket_ts=?",
+            (condition_id.lower(), bucket_ts),
         )
         return float(row["value"]) if row else None
 
-    async def set_snap_baseline(self, condition_id: str, volume: float) -> None:
+    async def set_snap_baseline(self, condition_id: str, bucket_ts: int, volume: float) -> None:
+        """记录某市场指定桶起点时刻的累计量；同桶覆盖（幂等）。"""
         await self._execute(
-            "INSERT INTO snap_volume_baseline(condition_id, value, updated_ts) "
-            "VALUES(?,?,?) ON CONFLICT(condition_id) DO UPDATE SET "
+            "INSERT INTO snap_volume_baseline(condition_id, bucket_ts, value, updated_ts) "
+            "VALUES(?,?,?,?) ON CONFLICT(condition_id, bucket_ts) DO UPDATE SET "
             "value=excluded.value, updated_ts=excluded.updated_ts",
-            (condition_id, volume, time.time()),
+            (condition_id.lower(), bucket_ts, volume, time.time()),
         )
 
     async def prune_snapshots(self, retention_days: int) -> None:

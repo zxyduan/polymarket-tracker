@@ -27,7 +27,6 @@ from src.snapshots.collector import (
 )
 from src.snapshots.commands import SnapshotCommandHandler
 from src.snapshots.renderer import render_snapshot_summary
-from src.snapshots.volume_tracker import VolumeTracker
 from src.sources.data_api_client import DataApiClient
 from src.sources.gamma_client import GammaClient
 from src.sources.rtds_client import RtdsClient
@@ -124,9 +123,14 @@ async def snapshot_collect_loop(
 
 
 async def _snapshot_collect_round(
-    collector: SnapshotCollector, markets: list[Any]
+    collector: SnapshotCollector, markets: list[Any], *, backfill: bool = True
 ) -> None:
-    """采集一轮全部市场；单市场失败跳过不影响整轮。"""
+    """采集一轮全部市场；单市场失败跳过不影响整轮。
+
+    backfill=True（2h 边界轮）：补算上一闭合桶成交量增量；
+    backfill=False（/snap now 手动轮）：只采集当前桶，不碰闭合桶
+    （手动轮可能落在桶内，基线差会混入跨桶增量）。
+    """
     for m in markets:
         try:
             cid = m.condition_id
@@ -152,6 +156,7 @@ async def _snapshot_collect_round(
                 slug_id=m.slug_id,
                 fv_initial=m.fv_initial,
                 fv_end_date=m.fv_end_date,
+                backfill=backfill,
             )
         except Exception as exc:  # noqa: BLE001 - 单市场失败跳过
             logger.warning("快照采集失败 %s: %s", m.slug_id, exc)
@@ -267,17 +272,12 @@ async def amain(config_path: str) -> None:
     endpoints = settings.section("endpoints")
     polling = settings.section("polling")
 
-    # 快照成交量累加器：RTDS 白名单市场成交按桶记账，供快照闭合桶补算精确增量。
-    # 白名单在 markets 定义后初始化（见下方 set_tracked_cids 调用）。
-    volume_tracker = VolumeTracker()
-
     # 客户端
     rtds = RtdsClient(
         str(endpoints.get("rtds")),
         heartbeat_seconds=int(polling.get("rtds_heartbeat_seconds", 15)),
         reconnect_min_seconds=float(polling.get("reconnect_min_seconds", 1)),
         reconnect_max_seconds=float(polling.get("reconnect_max_seconds", 30)),
-        volume_tracker=volume_tracker,
     )
     data_api = DataApiClient(
         str(endpoints.get("data_api")),
@@ -321,21 +321,12 @@ async def amain(config_path: str) -> None:
         logger.info("快照市场 %d 个: %s", len(markets), [m.slug_id for m in markets])
     else:
         logger.info("快照市场为空（config/markets.toml 未配置），仅注册推送循环")
-    # RTDS 记账白名单：配置显式 cid + 快照表历史出现过的 cid
-    # （resolve 出的 cid 由 collector.collect 自动补入；/add /remove 动态增减）。
-    # 只记自选市场 → 内存有界，不会随全市场成交流无限增长。
-    if markets:
-        known_cids = {
-            m.condition_id for m in markets if m.condition_id
-        } | set(await storage.distinct_snapshot_cids())
-        volume_tracker.set_tracked_cids(known_cids)
     snap_collector = SnapshotCollector(
         storage,
         gamma_host=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
         clob_host=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
         timeout=float(snapshot_cfg.get("request_timeout_seconds", 15)),
         price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
-        volume_tracker=volume_tracker,
     )
     snap_health: dict[str, Any] = {"snap_last_push": "-"}
     snap_auth: AuthManager | None = None
@@ -369,15 +360,11 @@ async def amain(config_path: str) -> None:
                     row["current_price"] = live[cid]
         except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
             logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
-        # 上一闭合桶份额：数据库已结算值优先，内存 RTDS 记账兜底
+        # 上一闭合桶份额：直接读库（v10：基线差按桶精确落库，无内存兜底；
+        # -1 = 未知，渲染显示"-"）
         for row in rows:
-            cid = str(row.get("condition_id") or "")
-            if not cid:
-                continue
             shares = row.get("volume_shares")
-            if shares is None and volume_tracker is not None:
-                shares = volume_tracker.bucket_shares(cid, prev_bucket_ts)
-            row["volume_shares_display"] = float(shares or 0.0)
+            row["volume_shares_display"] = float(shares) if shares is not None else 0.0
         alert = render_snapshot_summary(
             rows,
             tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
@@ -398,8 +385,8 @@ async def amain(config_path: str) -> None:
         ).strftime("%m-%d %H:%M")
 
     async def trigger_snapshot_now() -> None:
-        """/snap now：采集一轮 + 立即推送。"""
-        await _snapshot_collect_round(snap_collector, markets)
+        """/snap now：采集一轮（不补算闭合桶）+ 立即推送。"""
+        await _snapshot_collect_round(snap_collector, markets, backfill=False)
         await trigger_snapshot_push()
 
     tasks = [
@@ -487,7 +474,6 @@ async def amain(config_path: str) -> None:
             storage,
             trigger_snapshot_now,
             snap_health,
-            volume_tracker=volume_tracker,
             markets_path=str(settings.config_path.parent / "markets.toml"),
         )
         tasks.append(

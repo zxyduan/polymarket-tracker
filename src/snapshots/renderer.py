@@ -21,8 +21,8 @@ def _fmt_volume(value: float | None) -> str:
 
 
 def _fmt_shares(value: float | None) -> str:
-    """份额显示：0 = 真实零成交显示 0；无数据显示 -。"""
-    if value is None:
+    """份额显示：0 = 真实零成交显示 0；-1 = 未知（RTDS 未记账）显示 -。"""
+    if value is None or (isinstance(value, (int, float)) and value < 0):
         return "-"
     return f"{value:,.0f}"
 
@@ -88,11 +88,10 @@ def render_snapshot_summary(
         amp = _bucket_amplitude(row)
         amp_s = f"{amp:.1f}%" if amp is not None else "-"
         volume = _fmt_shares(row.get("volume_shares_display"))
-        volume_usdc = _fmt_volume(row.get("volume_delta"))
         current = row.get("current_price")
         price = _fmt_price(current if current is not None else row.get("price_close"))
         line = (
-            f"{i}️⃣ {_market_label(row)}：量 {volume} 份（{volume_usdc}）"
+            f"{i}️⃣ {_market_label(row)}：量 {volume} 份"
             f" ｜ 波动 {regime}·{amp_s} ｜ 现价 {price} {icon}{trend_pct}"
         ).rstrip()
         lines.append(line)
@@ -113,46 +112,44 @@ def render_market_list(markets: list[Any]) -> str:
 
 
 def _fmt_shares(value: float | None) -> str:
-    """份额显示：0 = 真实零成交显示 0；无数据显示 -。"""
-    if value is None:
+    """份额显示：0 = 真实零成交显示 0；-1 = 未知（RTDS 未记账）显示 -。"""
+    if value is None or (isinstance(value, (int, float)) and value < 0):
         return "-"
     return f"{value:,.0f}"
 
 
-async def render_tracker_status(storage: Any, tracker: Any | None) -> str:
-    """RTDS 记账实时状态（/vol 指令）：每个市场「当前桶｜上一闭合桶」，
-    双口径：份额（主）+ USDC（辅，用于与 Gamma volumeNum 对账）。
+async def render_tracker_status(storage: Any, collector: Any) -> str:
+    """成交量实时状态（/vol，v10 基线差口径，免等 2h 验证链路）。
 
-    - 当前桶：内存实时累计（RTDS 逐笔记账，会一直涨）
-    - 上一闭合桶：优先数据库已结算值（volume_delta/volume_shares），
-      内存值被采集器 settle 取走写库后不再显示 0，避免误读。
+    Gamma volumeNum 官方口径为份额：
+    - 当前桶增量 = 实时累计份额 - 当前桶起点基线份额（秒级验证，不写库）
+    - 上一闭合桶 = 库内已补算份额（真实成交份额）
     """
     now_bucket = (int(time.time()) // BUCKET_SIZE_SEC) * BUCKET_SIZE_SEC
     prev_bucket = now_bucket - BUCKET_SIZE_SEC
     rows = await storage.latest_complete_buckets(now_bucket)
     if not rows:
-        return "<b>RTDS 记账状态</b>\n暂无快照数据（先跑一轮采集）"
+        return "<b>成交量状态</b>\n暂无快照数据（先跑一轮采集）"
     lines = [
-        "<b>RTDS 记账状态</b>",
-        "格式：市场｜当前桶(份额/USDC)｜上一闭合桶(份额/USDC)",
+        "<b>成交量状态</b>",
+        "格式：市场｜当前桶(份)｜上一闭合桶(份)",
     ]
     for r in rows:
         cid = str(r.get("condition_id") or "")
         slug_id = html_escape(str(r.get("slug_id") or r.get("slug") or "?"))
-        # 当前桶：内存实时值（份额 + USDC）
-        cur_sh = tracker.bucket_shares(cid, now_bucket) if cid and tracker else None
-        cur_us = tracker.bucket_volume(cid, now_bucket) if cid and tracker else None
-        # 上一闭合桶：数据库已结算值优先，内存份额兜底
+        # 当前桶：实时累计份额 - 桶起点基线份额（免等 2h 验证链路）
+        cur_sh: float | None = None
+        if cid:
+            try:
+                cum = await collector._fetch_cumulative_volume(cid)
+                base_cur = await storage.get_snap_baseline(cid, now_bucket)
+                if cum is not None and base_cur is not None:
+                    cur_sh = max(0.0, cum - base_cur)
+            except Exception as exc:  # noqa: BLE001 - 单市场失败降级
+                cur_sh = None
+        # 上一闭合桶：库内已结算份额
         prev_sh = r.get("volume_shares")
-        if prev_sh is None and cid and tracker:
-            prev_sh = tracker.bucket_shares(cid, prev_bucket)
-        prev_us = r.get("volume_delta")
-        cur_s = f"{cur_sh:,.0f}/{cur_us:,.0f}" if cur_sh else "0/0"
-        if cur_sh is None and cur_us:
-            cur_s = f"-/{cur_us:,.0f}"
-        if prev_sh:
-            prev_s = f"{prev_sh:,.0f}/{prev_us:,.0f}" if prev_us else f"{prev_sh:,.0f}/-"
-        else:
-            prev_s = f"-/{prev_us:,.0f}" if prev_us else "0/0"
+        cur_s = f"{cur_sh:,.0f}" if cur_sh is not None and cur_sh > 0 else "0"
+        prev_s = _fmt_shares(prev_sh)
         lines.append(f"{slug_id}｜{cur_s}｜{prev_s}")
     return "\n".join(lines)

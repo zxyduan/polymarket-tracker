@@ -127,12 +127,14 @@ class SnapshotCollector:
         slug_id: str,
         fv_initial: float = 0.0,
         fv_end_date: str = "",
+        backfill: bool = True,
     ) -> None:
-        """跑一次完整采集：新市场回填 → 拉数据 → 算特征 → 写入 → 清理。"""
-        # 0a. 把本市场加入 RTDS 记账白名单（/add 后首轮采集即生效；
-        #     已在白名单则幂等），避免全市场记账导致内存无界增长
-        if self._volume_tracker is not None:
-            self._volume_tracker.add_tracked_cid(condition_id)
+        """跑一次完整采集：新市场回填 → 拉数据 → 算特征 → 写入 → 清理。
+
+        backfill=True（每 2h 边界轮）：补算上一闭合桶成交量（累计量 - 桶起点基线），
+        并记录当前桶起点基线；backfill=False（/snap now 手动轮）只采集当前桶，
+        不补算闭合桶——手动轮可能落在桶内，基线差会混入跨桶增量。
+        """
         # 0. 新市场自动回填历史（库里没有任何桶才跑）
         existing = await self._storage.recent_snapshots(condition_id, buckets=1)
         if not existing:
@@ -145,52 +147,12 @@ class SnapshotCollector:
 
         bucket_ts = _current_bucket_start()
 
-        # 1. 拉累计成交量
+        # 1. 拉累计成交量（Gamma volumeNum，USDC 累计口径）
         cum_volume = await self._fetch_cumulative_volume(condition_id)
 
-        # 2. 算自上次采集以来的增量（上一闭合桶的最终成交量）
-        prev_vol = await self._storage.get_snap_baseline(condition_id)
-        volume_delta = _calc_volume_delta(cum_volume, prev_vol)
-
-        # 2b. 补算上一闭合桶：RTDS 全量成交记账优先（精确、实时、无需认证）。
-        #     低频市场 1-2h 才一笔，成交常发生在两轮采集之间，Gamma 基线差
-        #     会被上一轮基线"吃掉"（基线已含该成交 → 差值 0），RTDS 按
-        #     成交时间分桶记账可精确捞出整个闭合桶的成交量。
-        prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
-        volume_shares = 0.0
-        # 已被 RTDS 补算过的桶（volume_delta>0）不再用基线差覆盖：
-        # 同一桶内连续多轮（启动轮+手动轮）时基线差会把正确值写坏。
-        # 必须先判断再 settle：若桶已有值，跳过 settle（不 pop），否则
-        # RTDS 精确值会被取走丢弃且不写库（数据永久丢失）。
-        recent2 = await self._storage.recent_snapshots(condition_id, buckets=2)
-        prev_row = next(
-            (r for r in recent2 if int(r["bucket_ts"]) == prev_bucket_ts), None
-        )
-        prev_has_value = prev_row is not None and float(prev_row["volume_delta"]) > 0
-        if prev_has_value:
-            volume_delta = 0.0
-        elif self._volume_tracker is not None:
-            tracked = self._volume_tracker.settle(condition_id, prev_bucket_ts)
-            if tracked is not None:
-                volume_delta = tracked
-                # 份额与 USDC 同步记账（RTDS 每笔按 price 换算），settle 只取
-                # USDC，份额账本保留；price 缺失的成交不计份额
-                volume_shares = self._volume_tracker.bucket_shares(
-                    condition_id, prev_bucket_ts
-                ) or 0.0
-        # 有正值增量就补算写库（RTDS 记账不依赖基线是否存在）
-        if volume_delta > 0:
-            await self._storage.update_snapshot_volume(
-                condition_id, prev_bucket_ts, volume_delta, volume_shares
-            )
-            logger.info(
-                "snap prev-bucket cid=%s bucket=%s vol=%.0f shares=%.0f",
-                condition_id[:8],
-                prev_bucket_ts,
-                volume_delta,
-                volume_shares,
-            )
-        # 当前桶刚开，本桶写入 0；闭合后由下一轮补算真实增量
+        # 2. 闭合桶成交量延后到 OHLC 之后补算（步骤 7a）：口径 =
+        #    当前累计量 - 该桶起点基线（基线按桶落库，重启不丢）。
+        #    当前桶（未闭合）本桶写入 0，闭合后由边界轮补算真实增量。
         current_volume_delta = 0.0
 
         # 3. 拉价格历史，提取本桶 OHLC
@@ -230,7 +192,32 @@ class SnapshotCollector:
         market_fv = (price_open + price_close) / 2 if price_open > 0 and price_close > 0 else 0.0
         our_fv = _calc_our_fv(fv_initial, fv_end_date)
 
-        # 7. 写入（幂等 UPSERT）
+        # 7a. 补算上一闭合桶成交量 = 当前累计量 - 该桶起点基线（v10，仅边界轮）。
+        #     Gamma volumeNum/volume24hr 官方口径为"份额"（成交的 YES/NO token 数量，
+        #     非 USDC 金额，2026-10-20 实测交叉验证：22:00 桶 RTDS size 加总 5707 份
+        #     ≈ volume24hr 69,628/12≈5802 份/桶）。
+        #     差值即该闭合桶全部成交份额，与采集轮次/服务重启无关，天然防重复覆盖。
+        if backfill and cum_volume is not None:
+            prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
+            prev_volume = await self._storage.get_snap_baseline(
+                condition_id, prev_bucket_ts
+            )
+            if prev_volume is not None:
+                delta_shares = max(0.0, cum_volume - prev_volume)
+                if delta_shares > 1e-6:
+                    # volume_delta 无 USDC 口径（用户明确不计算 USDC），写 0；
+                    # 份额为真实成交份额，直接落 volume_shares。
+                    await self._storage.update_snapshot_volume(
+                        condition_id, prev_bucket_ts, 0.0, delta_shares
+                    )
+                    logger.info(
+                        "snap prev-bucket cid=%s bucket=%s shares=%.2f",
+                        condition_id[:8],
+                        prev_bucket_ts,
+                        delta_shares,
+                    )
+
+        # 7b. 写入（幂等 UPSERT）
         await self._storage.upsert_snapshot(
             condition_id=condition_id,
             slug=slug,
@@ -258,11 +245,13 @@ class SnapshotCollector:
             market_fv=market_fv,
         )
 
-        # 保存成交量基线
+        # 8. 记录当前桶起点基线：只写一次（桶刚开的第一轮），保证差值口径是
+        #    "桶起点累计量"；服务重启后基线仍在库中，闭合桶补算不受影响。
         if cum_volume is not None:
-            await self._storage.set_snap_baseline(condition_id, cum_volume)
+            if await self._storage.get_snap_baseline(condition_id, bucket_ts) is None:
+                await self._storage.set_snap_baseline(condition_id, bucket_ts, cum_volume)
 
-        # 8. 清理旧数据
+        # 9. 清理旧数据
         await self._storage.prune_snapshots(RETENTION_DAYS)
         logger.info(
             "snapshot collected cid=%s bucket=%s vol=%.0f regime=%s",

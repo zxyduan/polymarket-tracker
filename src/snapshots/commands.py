@@ -32,7 +32,6 @@ class SnapshotCommandHandler:
         storage: Any,
         trigger_snapshot: Callable[[], Awaitable[None]],
         health: dict[str, Any],
-        volume_tracker: Any | None = None,
         markets_path: str | None = None,
     ) -> None:
         self.markets = markets
@@ -40,7 +39,6 @@ class SnapshotCommandHandler:
         self.storage = storage
         self.trigger_snapshot = trigger_snapshot
         self.health = health
-        self.volume_tracker = volume_tracker
         self.markets_path = markets_path
 
     async def __call__(self, text: str, chat_id: int) -> str | None:
@@ -56,7 +54,7 @@ class SnapshotCommandHandler:
         if command == "/snap":
             return await self._snap_now()
         if command == "/vol":
-            return await render_tracker_status(self.storage, self.volume_tracker)
+            return await render_tracker_status(self.storage, self.collector)
         if command == "/status":
             return await self._status()
         if command == "/add":
@@ -120,8 +118,6 @@ class SnapshotCommandHandler:
             except Exception as exc:  # noqa: BLE001 - 落盘失败必须回滚
                 self.markets.remove(entry)
                 return f"❌ 写入配置失败，未添加：{exc}"
-        if self.volume_tracker is not None:
-            self.volume_tracker.add_tracked_cid(condition_id)
         return (
             f"✅ 已新增盘口：{slug_id}\n"
             f"slug：{slug}\n"
@@ -153,8 +149,6 @@ class SnapshotCommandHandler:
             except Exception as exc:  # noqa: BLE001 - 落盘失败必须回滚
                 self.markets.insert(0, removed)
                 return f"❌ 写入配置失败，未删除：{exc}"
-        if self.volume_tracker is not None and removed.condition_id:
-            self.volume_tracker.remove_tracked_cid(removed.condition_id)
         return (
             f"🗑️ 已删除盘口：{removed.slug_id}（{removed.slug}）\n"
             "已落盘，重启后仍生效；历史快照数据保留"
