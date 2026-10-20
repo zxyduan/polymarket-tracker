@@ -15,10 +15,11 @@ from dotenv import load_dotenv
 
 from src.bot.auth import AuthManager
 from src.bot.commands import CommandHandler
-from src.bot.telegram import BotRunner, TelegramApi
+from src.bot.telegram import BotRunner, TelegramApi, run_sender
 from src.core.models import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
+from src.notify import Notifier, build_notifiers
 from src.settings import Settings
 from src.snapshots.collector import (
     BUCKET_SIZE_SEC,
@@ -107,7 +108,9 @@ async def snapshot_collect_loop(
     （边界轮会补算上一闭合桶的成交量增量，推送必须等它完成才读到最新值）。
     """
     state = collect_state if collect_state is not None else {}
-    await _snapshot_collect_round(collector, markets)
+    # 启动首轮：只采集不写基线（可能落在桶中途，中途基线会污染差值口径）；
+    # 边界轮（每 2h 桶起点）才记录基线并补算上一闭合桶。
+    await _snapshot_collect_round(collector, markets, boundary=False)
     state["round_done_ts"] = float(time.time())
     while not stop_event.is_set():
         now = int(time.time())
@@ -118,18 +121,23 @@ async def snapshot_collect_loop(
             pass
         if stop_event.is_set():
             break
-        await _snapshot_collect_round(collector, markets)
+        await _snapshot_collect_round(collector, markets, boundary=True)
         state["round_done_ts"] = float(time.time())
 
 
 async def _snapshot_collect_round(
-    collector: SnapshotCollector, markets: list[Any], *, backfill: bool = True
+    collector: SnapshotCollector,
+    markets: list[Any],
+    *,
+    backfill: bool = True,
+    boundary: bool = True,
 ) -> None:
     """采集一轮全部市场；单市场失败跳过不影响整轮。
 
     backfill=True（2h 边界轮）：补算上一闭合桶成交量增量；
     backfill=False（/snap now 手动轮）：只采集当前桶，不碰闭合桶
     （手动轮可能落在桶内，基线差会混入跨桶增量）。
+    boundary：是否桶起点边界轮（控制是否记录当前桶起点基线）。
     """
     for m in markets:
         try:
@@ -157,6 +165,7 @@ async def _snapshot_collect_round(
                 fv_initial=m.fv_initial,
                 fv_end_date=m.fv_end_date,
                 backfill=backfill,
+                boundary=boundary,
             )
         except Exception as exc:  # noqa: BLE001 - 单市场失败跳过
             logger.warning("快照采集失败 %s: %s", m.slug_id, exc)
@@ -333,20 +342,20 @@ async def amain(config_path: str) -> None:
     snap_runner: BotRunner | None = None
     # 快照采集完成状态：round_done_ts = 最近一轮采集完成时刻（供整点推送等待）
     collect_state: dict[str, float] = {"round_done_ts": 0.0}
+    # 快照推送通道列表（见下方装配；可 telegram + ntfy 同时启用）
+    snap_notifiers: list[Notifier] = []
 
     async def trigger_snapshot_push() -> None:
         """读取最近完整桶 → 渲染总览 → 推送到快照 Bot 白名单。"""
         now_bucket = _current_bucket_start()
-        bucket_seconds = int(snapshot_cfg.get("bucket_seconds", 7200))
-        prev_bucket_ts = now_bucket - bucket_seconds
-        # 等待本桶边界的采集轮完成（该轮负责补算上一闭合桶增量），
-        # 最多 120s；超时降级用旧值推送，不阻塞整点节奏。
-        deadline = now_bucket + 120
-        while (
-            time.time() < deadline
-            and collect_state["round_done_ts"] < now_bucket - 1
-        ):
-            await asyncio.sleep(2)
+        # 推送前主动补算上一闭合桶份额（当前累计 - 桶起点基线）。
+        # 不依赖边界轮时序：整点推送与 2h 边界轮同刻触发，等轮次曾导致
+        # 推送读到未结算份额（全 0）；这里直接算好再读库，幂等可重复。
+        for m in markets:
+            try:
+                await snap_collector.backfill_prev_bucket(m.condition_id)
+            except Exception as exc:  # noqa: BLE001 - 单市场补算失败降级
+                logger.warning("推送前补算失败 %s: %s", m.slug_id, exc)
         rows = await storage.latest_complete_buckets(now_bucket)
         if not rows:
             logger.info("快照推送跳过：暂无完整桶数据")
@@ -361,10 +370,12 @@ async def amain(config_path: str) -> None:
         except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
             logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
         # 上一闭合桶份额：直接读库（v10：基线差按桶精确落库，无内存兜底；
-        # -1 = 未知，渲染显示"-"）
+        # NULL = 该桶基线缺失（未知），渲染显示"-"，不再误导为 0 成交）
         for row in rows:
             shares = row.get("volume_shares")
-            row["volume_shares_display"] = float(shares) if shares is not None else 0.0
+            row["volume_shares_display"] = (
+                float(shares) if shares is not None else -1.0
+            )
         alert = render_snapshot_summary(
             rows,
             tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
@@ -372,14 +383,15 @@ async def amain(config_path: str) -> None:
         )
         if alert is None:
             return
-        if snap_auth is not None and snap_runner is not None:
-            for chat_id in snap_auth.chats():
+        # 经全部推送通道投递（telegram 白名单多 chat / ntfy topic，可同时启用）
+        if snap_notifiers:
+            for notifier in snap_notifiers:
                 try:
-                    await snap_runner.api.send_message(chat_id, alert.html)
-                except Exception as exc:  # noqa: BLE001 - 单 chat 失败不影响
-                    logger.error("快照推送 %s 失败: %s", chat_id, exc)
+                    await notifier.send(alert.html)
+                except Exception as exc:  # noqa: BLE001 - 单通道失败不影响其他
+                    logger.error("快照推送失败(%s): %s", notifier.describe(), exc)
         else:
-            logger.warning("SNAPSHOT_BOT_TOKEN 未配置，快照总览未推送（仅采集落库）")
+            logger.warning("快照推送通道未配置，总览未推送（仅采集落库）")
         snap_health["snap_last_push"] = datetime.now(
             timezone(timedelta(hours=8))
         ).strftime("%m-%d %H:%M")
@@ -434,22 +446,36 @@ async def amain(config_path: str) -> None:
             )
         )
 
-    # Bot（Token 缺失时仅采集，不阻断）
-    if settings.bot_token:
+    # 推送通道装配：notify.platforms 列表（telegram | ntfy，可多平台同时启用）。
+    # 交易员告警队列经 run_sender 依次投递到全部通道；
+    # telegram 指令轮询（/add /remove /vol 等）仅在启用 telegram 且 token 已配置时启动。
+    trader_notifiers: list[Notifier] = []
+    tg_api: TelegramApi | None = None
+    auth: AuthManager | None = None
+    if "telegram" in settings.notify_platforms and settings.bot_token:
         tg_api = TelegramApi(settings.bot_token)
         auth = AuthManager(settings.allowed_chat_ids, storage)
         await auth.load()
-        bot = BotRunner(tg_api, storage, auth)
-        command_handler = CommandHandler(storage, health)
+    trader_notifiers = build_notifiers(settings, storage, tg_api, auth, kind="trader")
+    if trader_notifiers:
         tasks.append(
             asyncio.create_task(
                 supervised(
                     "bot_sender",
-                    lambda: bot.run_sender(message_queue, stop_event),
+                    lambda: run_sender(trader_notifiers, message_queue, stop_event),
                     stop_event,
                 )
             )
         )
+        logger.info(
+            "交易员推送通道已启用: %s",
+            [n.describe() for n in trader_notifiers],
+        )
+    else:
+        logger.warning("推送通道均未启用，交易员告警不推送")
+    if tg_api is not None and auth is not None:
+        bot = BotRunner(tg_api, storage, auth)
+        command_handler = CommandHandler(storage, health)
         tasks.append(
             asyncio.create_task(
                 supervised(
@@ -459,15 +485,14 @@ async def amain(config_path: str) -> None:
                 )
             )
         )
-    else:
-        logger.warning("BOT_TOKEN 未配置，仅采集不推送；配置后重启即可启用")
 
-    # 快照 Bot（独立 token / 独立白名单 / 独立指令，与交易员 Bot 隔离）
-    if settings.snapshot_bot_token:
-        snap_api = TelegramApi(settings.snapshot_bot_token)
+    # 快照推送通道（独立白名单 / 独立 topic；与交易员通道隔离，但平台列表共用）
+    snap_tg_api: TelegramApi | None = None
+    if "telegram" in settings.notify_platforms and settings.snapshot_bot_token:
+        snap_tg_api = TelegramApi(settings.snapshot_bot_token)
         snap_auth = AuthManager([], storage, state_key="snap_allowed_chats")
         await snap_auth.load()
-        snap_runner = BotRunner(snap_api, storage, snap_auth)
+        snap_runner = BotRunner(snap_tg_api, storage, snap_auth)
         snap_cmd = SnapshotCommandHandler(
             markets,
             snap_collector,
@@ -486,8 +511,16 @@ async def amain(config_path: str) -> None:
             )
         )
         logger.info("快照 Bot 已启用（独立白名单）")
+    snap_notifiers = build_notifiers(
+        settings, storage, snap_tg_api, snap_auth, kind="snapshot"
+    )
+    if snap_notifiers:
+        logger.info(
+            "快照推送通道已启用: %s",
+            [n.describe() for n in snap_notifiers],
+        )
     else:
-        logger.warning("SNAPSHOT_BOT_TOKEN 未配置，快照仅采集不推送")
+        logger.warning("快照推送通道均未启用，快照仅采集不推送")
 
     loop = asyncio.get_running_loop()
 

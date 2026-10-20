@@ -101,7 +101,7 @@ class SnapshotCommandHandler:
                 f"❌ 解析失败：{slug}\n"
                 "确认 slug 正确（Polymarket 页面 URL 末尾），或稍后重试"
             )
-        condition_id, yes_token = resolved
+        condition_id, _ = resolved
 
         entry = MarketEntry(
             slug_id=slug_id,

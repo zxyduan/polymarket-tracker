@@ -72,6 +72,24 @@ endpoints:
   clob_api: "https://clob.polymarket.com"
   polygonscan: "https://polygonscan.com"
 
+# 消息推送通道列表：可多平台同时启用（如 ntfy + telegram 一起推送）
+#   telegram：需要 BOT_TOKEN / SNAPSHOT_BOT_TOKEN（.env），支持 /指令 交互
+#   ntfy：无需 Bot token，订阅端 App 按 topic 收推送；单向推送（无指令交互）
+# 后续扩展其他平台时在此列表上新增枚举即可（src/notify/factory.py）
+notify:
+  platforms: ["telegram"]     # ["telegram"] | ["ntfy"] | ["ntfy", "telegram"] …
+  # 兼容旧写法（单平台）：platform: "ntfy"
+
+# ntfy 通道配置（notify.platforms 含 ntfy 时生效；server 可自建）
+ntfy:
+  server: "https://ntfy.sh"      # 或自建 https://ntfy.example.com
+  topic: "polymarket-alerts"     # 交易员告警 topic（订阅端 App 需订阅同名 topic）
+  snapshot_topic: "polymarket-snap"  # 快照总览 topic（缺省则用 topic）
+  access_token: ""               # 可选：私有 topic / 自建服务器鉴权（发布需 Bearer token）
+  title_prefix: "Polymarket"     # 可选：推送标题前缀
+  priority: ""                   # 可选：1-5（如 3=默认、4=高优先级）
+  tags: ""                       # 可选：英文逗号分隔，如 "chart,robot"
+
 # 可选：EOA → Gnosis Safe 代理钱包 CREATE2 派生常量
 # 留空 proxy_init_code 时跳过链上派生；联调阶段用真实地址验证（见校验报告 TBD-03）
 safe_proxy:

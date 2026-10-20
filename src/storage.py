@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     price_high        REAL NOT NULL,
     price_low         REAL NOT NULL,
     volume_delta      REAL NOT NULL DEFAULT 0.0,
-    volume_shares     REAL NOT NULL DEFAULT 0.0,
+    volume_shares     REAL NOT NULL DEFAULT -1.0,
     trend             TEXT NOT NULL DEFAULT '',
     trend_pct         REAL NOT NULL DEFAULT 0.0,
     trend_streak      INTEGER NOT NULL DEFAULT 0,
@@ -122,10 +122,16 @@ class Storage:
         # 旧库迁移：market_snapshots 补 volume_shares 列（新库 SCHEMA 已含）
         try:
             await self._execute(
-                "ALTER TABLE market_snapshots ADD COLUMN volume_shares REAL NOT NULL DEFAULT 0.0"
+                "ALTER TABLE market_snapshots ADD COLUMN volume_shares REAL NOT NULL DEFAULT -1.0"
             )
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # 语义迁移（v11）：volume_shares 默认 -1 = 未结算/未知；历史 0.0
+        # 全部是"未补算"的假 0（v10b 只写 delta>0 的补算），统一改 -1 显示"-"，
+        # 不再把"未知"误导为"真零成交"。
+        await self._execute(
+            "UPDATE market_snapshots SET volume_shares=-1.0 WHERE volume_shares=0.0"
+        )
         # 旧库迁移（v10）：snap_volume_baseline 改为按桶存储（重启不丢基线），
         # 旧表无 bucket_ts 列则重建（基线是临时采样值，可重建，无历史价值）。
         try:
@@ -401,7 +407,7 @@ class Storage:
         price_high: float,
         price_low: float,
         volume_delta: float,
-        volume_shares: float = 0.0,
+        volume_shares: float = -1.0,
         trend: str,
         trend_pct: float,
         trend_streak: int,
@@ -469,12 +475,12 @@ class Storage:
 
     async def update_snapshot_volume(
         self, condition_id: str, bucket_ts: int, volume_delta: float,
-        volume_shares: float = 0.0,
+        volume_shares: float = -1.0,
     ) -> None:
         """更新指定（已闭合）桶的成交量增量（USDC + 份额）；桶不存在则忽略（幂等）。
 
-        桶闭合时其 volume_delta 尚为 0（采集时桶刚开），由下一轮采集
-        （或推送前）用 RTDS 记账补算后写回，保证"最新成交量"可读。
+        桶闭合时其 volume_shares 尚为 -1（未知），由边界轮/推送前用
+        累计量-基线补算后写回；-1 保持"未知"显示"-"，不误导为真零。
         """
         await self._execute(
             "UPDATE market_snapshots SET volume_delta=?, volume_shares=?, collected_ts=? "

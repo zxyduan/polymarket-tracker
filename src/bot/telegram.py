@@ -14,6 +14,28 @@ from src.utils.retry import with_retry
 logger = logging.getLogger(__name__)
 
 
+async def run_sender(
+    notifiers: list[Any],
+    message_queue: asyncio.Queue[AlertMessage],
+    stop_event: asyncio.Event,
+) -> None:
+    """消费告警队列，经全部推送通道投递（限速/重试/落库由各通道实现）。
+
+    notifiers 为 src.notify.Notifier 实现列表（telegram / ntfy / 未来平台），
+    同一告警依次发送到每个通道，单通道失败不影响其他通道。
+    """
+    while not stop_event.is_set():
+        alert = await message_queue.get()
+        for notifier in notifiers:
+            try:
+                await notifier.send(
+                    alert.html, buttons=alert.buttons, event_keys=alert.event_keys
+                )
+            except Exception as exc:  # noqa: BLE001 - 通道失败不阻断队列
+                logger.error("推送失败(%s): %s", notifier.describe(), exc)
+        message_queue.task_done()
+
+
 class TelegramApi:
     """Telegram Bot API 的最小封装。"""
 

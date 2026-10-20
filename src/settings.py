@@ -161,6 +161,32 @@ class Settings:
         return os.getenv("SNAPSHOT_BOT_TOKEN", "").strip()
 
     @property
+    def notify_platforms(self) -> list[str]:
+        """推送平台列表（可多个同时启用）：telegram | ntfy，缺省 ["telegram"]。
+
+        支持两种写法：
+        - 新：notify.platforms: ["ntfy", "telegram"]  ← 多平台同时推送
+        - 旧：notify.platform: "ntfy"                 ← 单平台（自动包成列表）
+        后续扩展其他平台时在此枚举上增加实现（见 src/notify/factory）。
+        """
+        raw_val = self.get("notify.platforms", self.get("notify.platform", "telegram"))
+        if isinstance(raw_val, list):
+            values = [str(v).strip().lower() for v in raw_val]
+        else:
+            values = [str(raw_val).strip().lower()]
+        return [v for v in values if v]
+
+    @property
+    def notify_platform(self) -> str:
+        """单平台语义（兼容旧调用方）：取平台列表第一个，缺省 telegram。"""
+        return self.notify_platforms[0] if self.notify_platforms else "telegram"
+
+    @property
+    def ntfy(self) -> dict[str, Any]:
+        """ntfy 通道配置节（server/topic/access_token/…）。"""
+        return self.section("ntfy")
+
+    @property
     def snapshot_push(self) -> dict[str, Any]:
         """snapshot_push 配置节（推送调度）。"""
         return self.section("snapshot_push")

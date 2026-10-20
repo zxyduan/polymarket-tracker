@@ -126,7 +126,6 @@ async def render_tracker_status(storage: Any, collector: Any) -> str:
     - 上一闭合桶 = 库内已补算份额（真实成交份额）
     """
     now_bucket = (int(time.time()) // BUCKET_SIZE_SEC) * BUCKET_SIZE_SEC
-    prev_bucket = now_bucket - BUCKET_SIZE_SEC
     rows = await storage.latest_complete_buckets(now_bucket)
     if not rows:
         return "<b>成交量状态</b>\n暂无快照数据（先跑一轮采集）"
@@ -145,7 +144,7 @@ async def render_tracker_status(storage: Any, collector: Any) -> str:
                 base_cur = await storage.get_snap_baseline(cid, now_bucket)
                 if cum is not None and base_cur is not None:
                     cur_sh = max(0.0, cum - base_cur)
-            except Exception as exc:  # noqa: BLE001 - 单市场失败降级
+            except Exception:  # noqa: BLE001 - 单市场失败降级
                 cur_sh = None
         # 上一闭合桶：库内已结算份额
         prev_sh = r.get("volume_shares")

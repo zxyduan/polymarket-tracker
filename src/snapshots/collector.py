@@ -128,12 +128,16 @@ class SnapshotCollector:
         fv_initial: float = 0.0,
         fv_end_date: str = "",
         backfill: bool = True,
+        boundary: bool = True,
     ) -> None:
         """跑一次完整采集：新市场回填 → 拉数据 → 算特征 → 写入 → 清理。
 
-        backfill=True（每 2h 边界轮）：补算上一闭合桶成交量（累计量 - 桶起点基线），
-        并记录当前桶起点基线；backfill=False（/snap now 手动轮）只采集当前桶，
-        不补算闭合桶——手动轮可能落在桶内，基线差会混入跨桶增量。
+        backfill=True（每 2h 边界轮）：补算上一闭合桶成交量（累计量 - 桶起点基线）；
+        backfill=False（/snap now 手动轮）只采集当前桶，不补算闭合桶。
+
+        boundary=True（桶起点边界轮）才允许记录当前桶起点基线；重启首轮 /
+        桶中途轮传 False —— 基线必须取"桶起点累计量"，中途记录会把跨时段
+        增量混入差值（曾导致 /vol 当前桶虚高、闭合桶失真）。
         """
         # 0. 新市场自动回填历史（库里没有任何桶才跑）
         existing = await self._storage.recent_snapshots(condition_id, buckets=1)
@@ -197,25 +201,8 @@ class SnapshotCollector:
         #     非 USDC 金额，2026-10-20 实测交叉验证：22:00 桶 RTDS size 加总 5707 份
         #     ≈ volume24hr 69,628/12≈5802 份/桶）。
         #     差值即该闭合桶全部成交份额，与采集轮次/服务重启无关，天然防重复覆盖。
-        if backfill and cum_volume is not None:
-            prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
-            prev_volume = await self._storage.get_snap_baseline(
-                condition_id, prev_bucket_ts
-            )
-            if prev_volume is not None:
-                delta_shares = max(0.0, cum_volume - prev_volume)
-                if delta_shares > 1e-6:
-                    # volume_delta 无 USDC 口径（用户明确不计算 USDC），写 0；
-                    # 份额为真实成交份额，直接落 volume_shares。
-                    await self._storage.update_snapshot_volume(
-                        condition_id, prev_bucket_ts, 0.0, delta_shares
-                    )
-                    logger.info(
-                        "snap prev-bucket cid=%s bucket=%s shares=%.2f",
-                        condition_id[:8],
-                        prev_bucket_ts,
-                        delta_shares,
-                    )
+        if backfill:
+            await self.backfill_prev_bucket(condition_id)
 
         # 7b. 写入（幂等 UPSERT）
         await self._storage.upsert_snapshot(
@@ -245,9 +232,11 @@ class SnapshotCollector:
             market_fv=market_fv,
         )
 
-        # 8. 记录当前桶起点基线：只写一次（桶刚开的第一轮），保证差值口径是
-        #    "桶起点累计量"；服务重启后基线仍在库中，闭合桶补算不受影响。
-        if cum_volume is not None:
+        # 8. 记录当前桶起点基线：仅边界轮（boundary=True）且该桶尚无基线时写。
+        #    重启首轮/桶中途轮（boundary=False）不写——基线必须取"桶起点累计量"，
+        #    中途写入会把跨时段增量混入差值（曾导致 /vol 当前桶虚高、闭合桶失真）。
+        #    基线按桶落库（condition_id, bucket_ts），重启不丢，闭合桶补算不受影响。
+        if cum_volume is not None and backfill and boundary:
             if await self._storage.get_snap_baseline(condition_id, bucket_ts) is None:
                 await self._storage.set_snap_baseline(condition_id, bucket_ts, cum_volume)
 
@@ -259,6 +248,48 @@ class SnapshotCollector:
             bucket_ts,
             current_volume_delta,
             vol_regime,
+        )
+
+    async def backfill_prev_bucket(self, condition_id: str) -> None:
+        """补算上一闭合桶份额 = 当前累计量 - 该桶起点基线（幂等，可重复调用）。
+
+        与 collect() 的 7a 共用同一口径；供整点推送前主动补算，
+        消除"推送先于边界轮、读到未结算份额"的竞态。
+        基线缺失（该桶起点从未记录）时跳过——该桶份额保持未知（-），
+        从下一个正常闭合桶起自动正确。
+        """
+        cum_volume = await self._fetch_cumulative_volume(condition_id)
+        if cum_volume is None:
+            return
+        bucket_ts = _current_bucket_start()
+        prev_bucket_ts = bucket_ts - BUCKET_SIZE_SEC
+        prev_volume = await self._storage.get_snap_baseline(
+            condition_id, prev_bucket_ts
+        )
+        if prev_volume is None:
+            logger.info(
+                "snap prev-bucket skip cid=%s bucket=%s（基线缺失，该桶未知）",
+                condition_id[:8],
+                prev_bucket_ts,
+            )
+            return
+        delta_shares = max(0.0, cum_volume - prev_volume)
+        if delta_shares <= 1e-6:
+            # 真零成交：显式结算为 0（区别于"未知"-1，推送显示 0 而非 -）
+            await self._storage.update_snapshot_volume(
+                condition_id, prev_bucket_ts, 0.0, 0.0
+            )
+            return
+        # volume_delta 无 USDC 口径（用户明确不计算 USDC），写 0；
+        # 份额为真实成交份额，直接落 volume_shares。
+        await self._storage.update_snapshot_volume(
+            condition_id, prev_bucket_ts, 0.0, delta_shares
+        )
+        logger.info(
+            "snap prev-bucket cid=%s bucket=%s shares=%.2f",
+            condition_id[:8],
+            prev_bucket_ts,
+            delta_shares,
         )
 
     async def backfill_history(
