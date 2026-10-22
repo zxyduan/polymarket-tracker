@@ -7,6 +7,7 @@ import logging
 from decimal import Decimal
 from typing import Any
 
+from src.core.digest import DigestConfig, DigestManager
 from src.core.models import StandardEvent
 from src.core.renderer import AlertMessage, render_alert
 from src.sources.gamma_client import GammaClient
@@ -90,6 +91,17 @@ class PipelineRunner:
         self.gamma = gamma
         self.settings = settings
         self.aggregator: Aggregator | None = None
+        # 批量摘要配置在启动时解析校验：非法值这里直接抛 ValueError，
+        # 让服务启动失败暴露问题，而不是等任务被监护反复重启。
+        digest_cfg = DigestConfig.from_section(settings.section("digest"))
+        self.digest = DigestManager(
+            digest_cfg,
+            out_queue,
+            tz_offset_hours=int(settings.get("display.timezone_offset_hours", 8)),
+            polygonscan_base=settings.get(
+                "endpoints.polygonscan", "https://polygonscan.com"
+            ),
+        )
 
     async def run(self) -> None:
         cfg = self.settings.section("filters")
@@ -116,6 +128,14 @@ class PipelineRunner:
                     if slug and not event.slug:
                         event.slug = slug
             label = label_map.get(events[0].wallet, "")
+            # digest 开启后：TRADE 成交流入摘要桶（窗口攒批/大单提前触发）；
+            # 生命周期事件（SPLIT/MERGE/REDEEM/CONVERT，及混合组）不进摘要，
+            # 按原逐笔路径即时推送。
+            if self.digest.cfg.enabled and all(
+                e.event_type == "TRADE" for e in events
+            ):
+                await self.digest.add(events[0].wallet, label, events)
+                return
             alert = render_alert(
                 events,
                 label=label,
@@ -147,6 +167,8 @@ class PipelineRunner:
                 self.in_queue.task_done()
 
     async def shutdown(self) -> None:
-        """停机时把尚未到期的聚合组立即产出。"""
+        """停机时把尚未到期的聚合组立即产出，摘要桶尽量补发。"""
         if self.aggregator is not None:
             await self.aggregator.flush_all()
+        if self.digest.cfg.enabled:
+            await self.digest.flush_all()

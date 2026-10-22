@@ -532,7 +532,9 @@ async def amain(config_path: str) -> None:
         logger.warning("推送通道均未启用，交易员告警不推送")
     if tg_api is not None and auth is not None:
         bot = BotRunner(tg_api, storage, auth)
-        command_handler = CommandHandler(storage, health)
+        command_handler = CommandHandler(
+            storage, health, digest_manager=pipeline.digest
+        )
         tasks.append(
             asyncio.create_task(
                 supervised(

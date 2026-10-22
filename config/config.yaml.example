@@ -24,6 +24,16 @@ filters:
     # 可选：SPLIT、MERGE、REDEEM、CONVERT、REWARD
   aggregate_window_seconds: 3            # 同一笔结算多笔成交的聚合窗口
 
+# 交易员告警批量摘要（攒批 + 大单提前触发；enabled=false 或不写本小节 = 逐笔即时推送）
+digest:
+  enabled: true
+  scope: "global"          # global=全部监控地址合并成一条摘要；wallet=每个地址各一条
+  window_seconds: 60       # 配置A：首条消息到达后最多攒 60s，到点把累计内容合成一条发出
+  flush_shares: 2000       # 配置B：窗口内累计成交量(份额) ≥ 2000 立即发送；0=不启用该方向
+  flush_usdc: 1000         # 配置B：窗口内累计成交额(USDC) ≥ 1000 立即发送；0=不启用该方向
+  # 说明：两个阈值是「或」关系；阈值触发后清零重新累计，连续大单连续推送，不限制次数；
+  #       无交易的窗口不发消息；min_notional_usd 以下的小额单不进摘要、不计数。
+
 # 市场元数据缓存
 market_cache:
   ttl_hours: 24

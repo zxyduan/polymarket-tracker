@@ -22,9 +22,17 @@ HELP_TEXT = (
 class CommandHandler:
     """解析并执行 Telegram 指令。"""
 
-    def __init__(self, storage: Any, health: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        storage: Any,
+        health: dict[str, Any],
+        *,
+        digest_manager: Any = None,
+    ) -> None:
         self.storage = storage
         self.health = health
+        # digest 摘要管理器（可选）：/remove 时清理该地址的未发摘要桶
+        self.digest_manager = digest_manager
 
     async def __call__(self, text: str, chat_id: int) -> str | None:
         parts = text.strip().split()
@@ -63,6 +71,9 @@ class CommandHandler:
         if not is_address(address):
             return "地址格式错误"
         ok, message = await self.storage.remove_wallet(address)
+        if ok and self.digest_manager is not None:
+            # 清理该地址未到期的摘要桶（global 模式为 no-op）
+            await self.digest_manager.discard_wallet(address)
         return f"{'✅' if ok else 'ℹ️'} {message}"
 
     async def _list(self) -> str:

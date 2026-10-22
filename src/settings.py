@@ -196,6 +196,11 @@ class Settings:
         """snapshot 配置节（采集参数）。"""
         return self.section("snapshot")
 
+    @property
+    def digest(self) -> dict[str, Any]:
+        """digest 配置节（交易员告警批量摘要）。"""
+        return self.section("digest")
+
     def section(self, name: str) -> dict[str, Any]:
         """取一个配置节，缺失时返回空 dict。"""
         return dict(self.raw.get(name, {}) or {})
