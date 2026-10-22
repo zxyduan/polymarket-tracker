@@ -488,6 +488,35 @@ class Storage:
             (volume_delta, volume_shares, time.time(), condition_id.lower(), bucket_ts),
         )
 
+    async def update_snapshot_prices(
+        self,
+        condition_id: str,
+        bucket_ts: int,
+        price_open: float,
+        price_close: float,
+        price_high: float,
+        price_low: float,
+    ) -> None:
+        """只更新某桶 OHLC（闭合桶收尾价点补齐用），不碰成交量等其他字段。
+
+        与 upsert_snapshot 的区别：upsert 冲突时会把 volume_shares 重置为 -1，
+        而补算已结算的量必须保留；桶不存在时静默忽略（幂等）。
+        """
+        await self._execute(
+            "UPDATE market_snapshots SET price_open=?, price_close=?, "
+            "price_high=?, price_low=?, collected_ts=? "
+            "WHERE condition_id=? AND bucket_ts=?",
+            (
+                price_open,
+                price_close,
+                price_high,
+                price_low,
+                time.time(),
+                condition_id.lower(),
+                bucket_ts,
+            ),
+        )
+
     async def recent_snapshots(
         self, condition_id: str, buckets: int = 30
     ) -> list[dict[str, Any]]:

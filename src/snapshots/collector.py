@@ -127,20 +127,30 @@ class SnapshotCollector:
         slug_id: str,
         fv_initial: float = 0.0,
         fv_end_date: str = "",
-        backfill: bool = True,
-        boundary: bool = True,
+        baseline_grace_seconds: int = 600,
     ) -> None:
-        """跑一次完整采集：新市场回填 → 拉数据 → 算特征 → 写入 → 清理。
+        """跑一次采集（幂等，可在同一个 2h 桶内重复执行）。
 
-        backfill=True（每 2h 边界轮）：补算上一闭合桶成交量（累计量 - 桶起点基线）；
-        backfill=False（/snap now 手动轮）只采集当前桶，不补算闭合桶。
+        调度器按固定间隔（默认 10 分钟，见 snapshot.collect_interval_seconds）
+        调用本方法，不再只在桶边界跑一次。每轮顺序：
 
-        boundary=True（桶起点边界轮）才允许记录当前桶起点基线；重启首轮 /
-        桶中途轮传 False —— 基线必须取"桶起点累计量"，中途记录会把跨时段
-        增量混入差值（曾导致 /vol 当前桶虚高、闭合桶失真）。
+        0. 新市场回填 30 天历史；
+        1. 拉 Gamma 累计成交量；
+        2. 拉 30 天价格历史；
+        3. 用已拉回的历史价点补写"缺失的闭合桶"（只插不覆盖，量留未知）；
+        4. 结算上一闭合桶量（不依赖当前桶是否有价点）；
+        5. 记录当前桶起点基线（桶起点宽限内的首次运行，不依赖价点）；
+        6. 当前桶有价点 → 算特征并 UPSERT；无价点 → 只刷新上一闭合桶
+           的最终 OHLC 后返回，下一轮（10 分钟后）重试，杜绝漏桶。
+
+        历史教训：旧版只在桶边界 +2s 采一次，低活跃市场新桶头几秒没有价点，
+        当轮直接 return 且永不补齐（日志 snap_no_current_bucket），漏桶滚雪球，
+        最新桶永久冻结；早退还跳过了上一桶补算与基线记录。
         """
         # 0. 新市场自动回填历史（库里没有任何桶才跑）
-        existing = await self._storage.recent_snapshots(condition_id, buckets=1)
+        existing = await self._storage.recent_snapshots(
+            condition_id, buckets=WINDOW_PERCENTILE_DAYS * 12 + 6
+        )
         if not existing:
             await self.backfill_history(
                 condition_id=condition_id,
@@ -148,29 +158,62 @@ class SnapshotCollector:
                 slug=slug,
                 slug_id=slug_id,
             )
+            existing = await self._storage.recent_snapshots(
+                condition_id, buckets=WINDOW_PERCENTILE_DAYS * 12 + 6
+            )
 
         bucket_ts = _current_bucket_start()
+        existing_ts = {int(r["bucket_ts"]) for r in existing}
 
-        # 1. 拉累计成交量（Gamma volumeNum，USDC 累计口径）
+        # 1. 拉累计成交量（Gamma volumeNum，份额累计口径）
         cum_volume = await self._fetch_cumulative_volume(condition_id)
 
-        # 2. 闭合桶成交量延后到 OHLC 之后补算（步骤 7a）：口径 =
-        #    当前累计量 - 该桶起点基线（基线按桶落库，重启不丢）。
-        #    当前桶（未闭合）本桶写入 0，闭合后由边界轮补算真实增量。
-        current_volume_delta = 0.0
-
-        # 3. 拉价格历史，提取本桶 OHLC
+        # 2. 拉价格历史
         price_points = await self._fetch_price_history(
             yes_token_id, days=WINDOW_PERCENTILE_DAYS
         )
         if not price_points:
+            # 价格流拉不到也要落基线（后续桶的量结算依赖它）
             logger.warning("snap_no_price cid=%s", condition_id[:8])
+            await self._record_baseline_if_grace(
+                condition_id, bucket_ts, cum_volume, baseline_grace_seconds
+            )
             return
 
         buckets = _bucketize_prices(price_points)
+
+        # 3. 补写缺失的闭合桶（只插不存在的桶，已有行一律不覆盖，量留未知）
+        await self.fill_missing_closed_buckets(
+            condition_id=condition_id,
+            slug=slug,
+            slug_id=slug_id,
+            buckets=buckets,
+            now_bucket=bucket_ts,
+            existing_ts=existing_ts,
+        )
+
+        # 4. 结算上一闭合桶量 = 当前累计量 - 该桶起点基线（幂等，每轮可重复）
+        if cum_volume is not None:
+            await self.backfill_prev_bucket(
+                condition_id, cum_volume=cum_volume
+            )
+
+        # 5. 记录当前桶起点基线（宽限内首次运行；不依赖价点，不依赖是否边界轮）
+        await self._record_baseline_if_grace(
+            condition_id, bucket_ts, cum_volume, baseline_grace_seconds
+        )
+
+        # 6. 当前桶尚无价点：用历史点刷新刚闭合桶的最终 OHLC，下一轮重试
         current_prices = buckets.get(bucket_ts)
         if current_prices is None:
-            logger.warning("snap_no_current_bucket cid=%s", condition_id[:8])
+            await self._refresh_closed_bucket_ohlc(
+                condition_id, bucket_ts - BUCKET_SIZE_SEC, buckets, existing_ts
+            )
+            logger.info(
+                "snap_no_current_bucket cid=%s bucket=%s（当前桶暂无价点，下轮重试）",
+                condition_id[:8],
+                bucket_ts,
+            )
             return
 
         price_open = current_prices[0]
@@ -178,10 +221,10 @@ class SnapshotCollector:
         price_high = max(current_prices)
         price_low = min(current_prices)
 
-        # 4. 拉订单簿快照
+        # 7. 拉订单簿快照
         book = await self._fetch_book_depth(yes_token_id)
 
-        # 5. 查历史快照，预计算特征
+        # 8. 查历史快照，预计算特征
         history = await self._storage.recent_snapshots(
             condition_id, buckets=WINDOW_PERCENTILE_DAYS * 12
         )
@@ -192,19 +235,11 @@ class SnapshotCollector:
         vol_short, vol_long, vol_regime = _calc_volatility(history)
         bid_depth_change = _calc_depth_change(book.bid_top5, history)
 
-        # 6. 合理价值（本期简化：market_fv=中间价；our_fv 按到期衰减）
+        # 9. 合理价值（本期简化：market_fv=中间价；our_fv 按到期衰减）
         market_fv = (price_open + price_close) / 2 if price_open > 0 and price_close > 0 else 0.0
         our_fv = _calc_our_fv(fv_initial, fv_end_date)
 
-        # 7a. 补算上一闭合桶成交量 = 当前累计量 - 该桶起点基线（v10，仅边界轮）。
-        #     Gamma volumeNum/volume24hr 官方口径为"份额"（成交的 YES/NO token 数量，
-        #     非 USDC 金额，2026-10-20 实测交叉验证：22:00 桶 RTDS size 加总 5707 份
-        #     ≈ volume24hr 69,628/12≈5802 份/桶）。
-        #     差值即该闭合桶全部成交份额，与采集轮次/服务重启无关，天然防重复覆盖。
-        if backfill:
-            await self.backfill_prev_bucket(condition_id)
-
-        # 7b. 写入（幂等 UPSERT）
+        # 10. 写入当前桶（幂等 UPSERT；当前桶未闭合，量保持 -1 未知）
         await self._storage.upsert_snapshot(
             condition_id=condition_id,
             slug=slug,
@@ -214,7 +249,7 @@ class SnapshotCollector:
             price_close=price_close,
             price_high=price_high,
             price_low=price_low,
-            volume_delta=current_volume_delta,
+            volume_delta=0.0,
             trend=trend,
             trend_pct=trend_pct,
             trend_streak=trend_streak,
@@ -232,33 +267,142 @@ class SnapshotCollector:
             market_fv=market_fv,
         )
 
-        # 8. 记录当前桶起点基线：仅边界轮（boundary=True）且该桶尚无基线时写。
-        #    重启首轮/桶中途轮（boundary=False）不写——基线必须取"桶起点累计量"，
-        #    中途写入会把跨时段增量混入差值（曾导致 /vol 当前桶虚高、闭合桶失真）。
-        #    基线按桶落库（condition_id, bucket_ts），重启不丢，闭合桶补算不受影响。
-        if cum_volume is not None and backfill and boundary:
-            if await self._storage.get_snap_baseline(condition_id, bucket_ts) is None:
-                await self._storage.set_snap_baseline(condition_id, bucket_ts, cum_volume)
-
-        # 9. 清理旧数据
+        # 11. 清理旧数据
         await self._storage.prune_snapshots(RETENTION_DAYS)
         logger.info(
-            "snapshot collected cid=%s bucket=%s vol=%.0f regime=%s",
+            "snapshot collected cid=%s bucket=%s regime=%s",
             condition_id[:8],
             bucket_ts,
-            current_volume_delta,
             vol_regime,
         )
 
-    async def backfill_prev_bucket(self, condition_id: str) -> None:
+    async def _record_baseline_if_grace(
+        self,
+        condition_id: str,
+        bucket_ts: int,
+        cum_volume: float | None,
+        grace_seconds: int,
+    ) -> None:
+        """桶起点宽限内首次运行时记录该桶起点基线（幂等）。
+
+        旧版只在"严格边界轮"记基线，而边界轮一旦因当前桶无价点早退，
+        基线就永远缺失，该桶量永久显示"-"。现在只要落在桶起点宽限窗口
+        （默认 10 分钟，与采集间隔一致）内都记录，保证基线不被价点缺失牵连。
+        重启时若已超出宽限（桶中途启动），仍不记录，避免把跨时段增量混入差值。
+        """
+        if cum_volume is None:
+            return
+        if int(time.time()) - bucket_ts > grace_seconds:
+            return
+        if await self._storage.get_snap_baseline(condition_id, bucket_ts) is not None:
+            return
+        await self._storage.set_snap_baseline(condition_id, bucket_ts, cum_volume)
+        logger.info(
+            "snap baseline cid=%s bucket=%s cum=%.2f",
+            condition_id[:8],
+            bucket_ts,
+            cum_volume,
+        )
+
+    async def fill_missing_closed_buckets(
+        self,
+        *,
+        condition_id: str,
+        slug: str,
+        slug_id: str,
+        buckets: dict[int, list[float]],
+        now_bucket: int,
+        existing_ts: set[int],
+        limit: int = 36,
+    ) -> int:
+        """用已拉回的历史价点补写缺失的闭合桶（只插不覆盖）。
+
+        边界轮空桶早退 / 服务停机 / 重启都会造成漏桶；这里每轮用同一份
+        30 天价格历史把缺口补齐（OHLC 取桶内价点，成交量无基线来源留未知 -1）。
+        只插入不存在的桶，绝不动已有行（已结算的量、特征都不能被覆盖）。
+        limit 限制单次最多补 36 个桶（3 天），避免长期停机后一轮写太多。
+        """
+        missing = sorted(
+            ts for ts in buckets if ts < now_bucket and ts not in existing_ts
+        )
+        if not missing:
+            return 0
+        for bucket_ts in missing[-limit:]:
+            prices = buckets[bucket_ts]
+            await self._storage.upsert_snapshot(
+                condition_id=condition_id,
+                slug=slug,
+                slug_id=slug_id,
+                bucket_ts=bucket_ts,
+                price_open=prices[0],
+                price_close=prices[-1],
+                price_high=max(prices),
+                price_low=min(prices),
+                volume_delta=0.0,
+                trend="",
+                trend_pct=0.0,
+                trend_streak=0,
+                trend_direction="",
+                drawdown_from_high=0.0,
+                price_percentile=0.5,
+                bid_depth_top5=0.0,
+                ask_depth_top5=0.0,
+                bid_wall_count=0,
+                bid_depth_change=0.0,
+                vol_short=0.0,
+                vol_long=0.0,
+                vol_regime="",
+            )
+        filled = min(len(missing), limit)
+        logger.info(
+            "snap gap-fill cid=%s missing=%d filled=%d",
+            condition_id[:8],
+            len(missing),
+            filled,
+        )
+        return filled
+
+    async def _refresh_closed_bucket_ohlc(
+        self,
+        condition_id: str,
+        bucket_ts: int,
+        buckets: dict[int, list[float]],
+        existing_ts: set[int],
+    ) -> None:
+        """当前桶暂无价点时，用最新历史点刷新刚闭合桶的最终 OHLC。
+
+        闭合桶最后一次完整 upsert 可能发生在桶结束前 10 分钟，末尾价点会漏；
+        只更新 OHLC 四列（update_snapshot_prices），不碰已结算的成交量。
+        """
+        if bucket_ts not in existing_ts:
+            return
+        prices = buckets.get(bucket_ts)
+        if not prices:
+            return
+        await self._storage.update_snapshot_prices(
+            condition_id,
+            bucket_ts,
+            prices[0],
+            prices[-1],
+            max(prices),
+            min(prices),
+        )
+
+    async def backfill_prev_bucket(
+        self,
+        condition_id: str,
+        cum_volume: float | None = None,
+    ) -> None:
         """补算上一闭合桶份额 = 当前累计量 - 该桶起点基线（幂等，可重复调用）。
 
-        与 collect() 的 7a 共用同一口径；供整点推送前主动补算，
-        消除"推送先于边界轮、读到未结算份额"的竞态。
+        cum_volume 可由调用方传入（collect 本轮已拉过一次，避免重复请求）；
+        缺省时自行拉 Gamma。供整点推送前主动补算，消除"推送先于采集轮、
+        读到未结算份额"的竞态。
         基线缺失（该桶起点从未记录）时跳过——该桶份额保持未知（-），
         从下一个正常闭合桶起自动正确。
         """
-        cum_volume = await self._fetch_cumulative_volume(condition_id)
+        if cum_volume is None:
+            cum_volume = await self._fetch_cumulative_volume(condition_id)
         if cum_volume is None:
             return
         bucket_ts = _current_bucket_start()

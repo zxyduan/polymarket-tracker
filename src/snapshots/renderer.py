@@ -62,12 +62,15 @@ def render_snapshot_summary(
     *,
     tz_offset_hours: int = 8,
     bucket_seconds: int = 7200,
+    now_bucket: int | None = None,
 ) -> AlertMessage | None:
     """将最近完整桶渲染为一条总览；无数据返回 None。
 
     rows 来自 latest_complete_buckets()：每个市场一条（bucket_ts 升序）。
     row 可带 current_price（推送前实时拉取），缺失时降级用 price_close。
-    若多个市场的桶时段不一致，取最早桶作为时段标题。
+    若多个市场的桶时段不一致，取最早桶作为时段标题，并在该行末尾标注其所属桶。
+    now_bucket 给定时，最新桶落后 ≥2 个桶（健康时恰好落后 1 个桶）会在标题下
+    追加数据延迟告警，避免采集停摆时旧数据被当成新行情反复推送。
     """
     if not rows:
         return None
@@ -80,6 +83,16 @@ def render_snapshot_summary(
     window = f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
 
     lines: list[str] = [f"📊 市场快照 · {window}（北京时间）"]
+
+    # 数据延迟告警：健康状态最新闭合桶恰好落后当前桶 1 个；>=2 说明有漏桶
+    if now_bucket is not None:
+        lag = (now_bucket - bucket_ts) // bucket_seconds
+        if lag >= 2:
+            stale_hours = (lag - 1) * bucket_seconds // 3600
+            lines.append(
+                f"⚠️ 数据延迟约 {stale_hours} 小时（最新闭合桶 {window}，采集异常，请查日志）"
+            )
+
     for i, row in enumerate(rows, 1):
         trend = str(row.get("trend") or "")
         icon = TREND_ICON.get(trend, "➡️")
@@ -94,6 +107,15 @@ def render_snapshot_summary(
             f"{i}️⃣ {_market_label(row)}：量 {volume} 份"
             f" ｜ 波动 {regime}·{amp_s} ｜ 现价 {price} {icon}{trend_pct}"
         ).rstrip()
+        # 该市场桶时间与标题窗口不一致时，显式标注其所属桶时段
+        if int(row["bucket_ts"]) != bucket_ts:
+            row_start = datetime.fromtimestamp(
+                int(row["bucket_ts"]), tz=local_tz
+            ).strftime("%H:%M")
+            row_end = datetime.fromtimestamp(
+                int(row["bucket_ts"]) + bucket_seconds, tz=local_tz
+            ).strftime("%H:%M")
+            line += f"（{row_start}-{row_end} 桶）"
         lines.append(line)
 
     body = "\n".join(lines)

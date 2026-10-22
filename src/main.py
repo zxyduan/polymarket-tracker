@@ -22,7 +22,6 @@ from src.core.renderer import AlertMessage
 from src.notify import Notifier, build_notifiers
 from src.settings import Settings
 from src.snapshots.collector import (
-    BUCKET_SIZE_SEC,
     SnapshotCollector,
     _current_bucket_start,
 )
@@ -101,43 +100,44 @@ async def snapshot_collect_loop(
     markets: list[Any],
     stop_event: asyncio.Event,
     collect_state: dict[str, float] | None = None,
+    interval_seconds: int = 600,
 ) -> None:
-    """每 2 小时一轮采集（对齐 UTC 桶边界）；启动先跑一轮（含 slug 解析）。
+    """固定间隔采集（默认 10 分钟一轮，桶内可重试）；启动先跑一轮。
 
-    collect_state 记录最近一轮采集完成的时间戳，供整点推送等待
-    （边界轮会补算上一闭合桶的成交量增量，推送必须等它完成才读到最新值）。
+    旧版只在 2h 桶边界 +2s 采一次，低活跃市场新桶头几秒没有价点时当轮
+    早退且永不补齐，最新桶永久冻结（10-20 事故）。改为 10 分钟一轮后：
+    - 新桶头几分钟没价点，下一轮（10 分钟内）即可补上；
+    - 每轮都用已拉回的历史价点补齐缺失闭合桶（漏桶自愈）；
+    - 每轮都幂等结算上一闭合桶量、在宽限窗口内记录新桶起点基线。
+
+    collect_state 记录最近一轮采集完成的时间戳。
     """
     state = collect_state if collect_state is not None else {}
-    # 启动首轮：只采集不写基线（可能落在桶中途，中途基线会污染差值口径）；
-    # 边界轮（每 2h 桶起点）才记录基线并补算上一闭合桶。
-    await _snapshot_collect_round(collector, markets, boundary=False)
+    # 启动首轮：collect 内部按"距桶起点的时间"自行决定是否记基线（超宽限不记），
+    # 不再依赖调用方区分边界轮/中途轮。
+    await _snapshot_collect_round(collector, markets)
     state["round_done_ts"] = float(time.time())
     while not stop_event.is_set():
         now = int(time.time())
-        delay = BUCKET_SIZE_SEC - (now % BUCKET_SIZE_SEC)
+        delay = interval_seconds - (now % interval_seconds)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=delay + 2)
         except asyncio.TimeoutError:
             pass
         if stop_event.is_set():
             break
-        await _snapshot_collect_round(collector, markets, boundary=True)
+        await _snapshot_collect_round(collector, markets)
         state["round_done_ts"] = float(time.time())
 
 
 async def _snapshot_collect_round(
     collector: SnapshotCollector,
     markets: list[Any],
-    *,
-    backfill: bool = True,
-    boundary: bool = True,
 ) -> None:
     """采集一轮全部市场；单市场失败跳过不影响整轮。
 
-    backfill=True（2h 边界轮）：补算上一闭合桶成交量增量；
-    backfill=False（/snap now 手动轮）：只采集当前桶，不碰闭合桶
-    （手动轮可能落在桶内，基线差会混入跨桶增量）。
-    boundary：是否桶起点边界轮（控制是否记录当前桶起点基线）。
+    collect() 幂等：同一桶内重复执行只补全不污染，补算与基线落库由
+    collector 内部按时间窗口自行判定。
     """
     for m in markets:
         try:
@@ -164,16 +164,18 @@ async def _snapshot_collect_round(
                 slug_id=m.slug_id,
                 fv_initial=m.fv_initial,
                 fv_end_date=m.fv_end_date,
-                backfill=backfill,
-                boundary=boundary,
             )
         except Exception as exc:  # noqa: BLE001 - 单市场失败跳过
             logger.warning("快照采集失败 %s: %s", m.slug_id, exc)
 
 
 def _parse_snapshot_schedule(schedule: list[str]) -> list[tuple[int, int, str]]:
-    """解析北京时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。"""
+    """解析北京时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。
+
+    同一时刻（含 00:00 与 24:00 并存）只保留一条，防止午夜/重复配置双推。
+    """
     out: list[tuple[int, int, str]] = []
+    seen: set[tuple[int, int]] = set()
     for item in schedule:
         text = str(item).strip()
         try:
@@ -184,9 +186,14 @@ def _parse_snapshot_schedule(schedule: list[str]) -> list[tuple[int, int, str]]:
             logger.warning("快照推送时间格式错误，跳过: %s", text)
             continue
         if hour == 24:
-            out.append((0, 0, "24:00"))
+            hour, label = 0, "24:00"
         else:
-            out.append((hour, minute, text))
+            label = text
+        key = (hour, minute)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((hour, minute, label))
     return out
 
 
@@ -196,7 +203,11 @@ async def snapshot_push_loop(
     trigger_push: Any,
     stop_event: asyncio.Event,
 ) -> None:
-    """北京时间 7 整点推送总览；已推过的整点不重推，错过的整点不补推。"""
+    """按配置的北京时间整点推送总览；已推过的整点不重推，错过的整点不补推。
+
+    重复内容由 trigger_snapshot_push 的 dedup 再去一层（2h 桶配整点推送时，
+    奇数点内容相同会被抑制）。
+    """
     push_cfg = settings.snapshot_push
     schedule = _parse_snapshot_schedule(push_cfg.get("schedule", []) or [])
     tz_offset = int(push_cfg.get("timezone_offset_hours", 8))
@@ -347,18 +358,39 @@ async def amain(config_path: str) -> None:
 
     async def trigger_snapshot_push() -> None:
         """读取最近完整桶 → 渲染总览 → 推送到快照 Bot 白名单。"""
+        import hashlib
+
         now_bucket = _current_bucket_start()
-        # 推送前主动补算上一闭合桶份额（当前累计 - 桶起点基线）。
-        # 不依赖边界轮时序：整点推送与 2h 边界轮同刻触发，等轮次曾导致
-        # 推送读到未结算份额（全 0）；这里直接算好再读库，幂等可重复。
+        bucket_seconds = int(snapshot_cfg.get("bucket_seconds", 7200))
+        # 推送前主动补算上一闭合桶份额（当前累计 - 桶起点基线），幂等可重复。
+        # 注意：markets.toml 允许只填 slug（condition_id 留空），必须先用
+        # 采集器解析出的 cid 补算，否则空 cid 请求 Gamma 会静默失败（旧 bug）。
         for m in markets:
             try:
-                await snap_collector.backfill_prev_bucket(m.condition_id)
+                cid = m.condition_id
+                if not cid:
+                    resolved = await snap_collector.resolve_market(m.slug)
+                    if resolved:
+                        cid = resolved[0]
+                if cid:
+                    await snap_collector.backfill_prev_bucket(cid)
             except Exception as exc:  # noqa: BLE001 - 单市场补算失败降级
                 logger.warning("推送前补算失败 %s: %s", m.slug_id, exc)
         rows = await storage.latest_complete_buckets(now_bucket)
         if not rows:
             logger.info("快照推送跳过：暂无完整桶数据")
+            return
+        # 数据陈旧守卫：最新桶落后超过阈值（默认 0=不跳过，仅标题提示延迟）
+        max_stale = int(snapshot_push_cfg.get("max_stale_buckets", 0) or 0)
+        lag_buckets = max(
+            (now_bucket - int(r["bucket_ts"])) // bucket_seconds for r in rows
+        )
+        if max_stale > 0 and lag_buckets > max_stale:
+            logger.info(
+                "快照推送跳过：数据落后 %d 个桶（阈值 %d），疑似采集异常",
+                lag_buckets,
+                max_stale,
+            )
             return
         # 推送前实时取各市场当前盘面价（失败降级用闭合桶收盘价）
         try:
@@ -369,7 +401,7 @@ async def amain(config_path: str) -> None:
                     row["current_price"] = live[cid]
         except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
             logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
-        # 上一闭合桶份额：直接读库（v10：基线差按桶精确落库，无内存兜底；
+        # 上一闭合桶份额：直接读库（基线差按桶精确落库；
         # NULL = 该桶基线缺失（未知），渲染显示"-"，不再误导为 0 成交）
         for row in rows:
             shares = row.get("volume_shares")
@@ -379,26 +411,40 @@ async def amain(config_path: str) -> None:
         alert = render_snapshot_summary(
             rows,
             tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
-            bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
+            bucket_seconds=bucket_seconds,
+            now_bucket=now_bucket,
         )
         if alert is None:
             return
+        # 正文去重：2h 桶配整点推送时，奇数点内容天然相同；采集停摆时旧桶
+        # 也会被反复推。内容与上一条完全一致则抑制（默认开，可配 dedup=false）。
+        if snapshot_push_cfg.get("dedup", True):
+            body_hash = hashlib.sha1(alert.html.encode("utf-8")).hexdigest()
+            if await storage.get_state("snap_push:body_hash") == body_hash:
+                logger.info("快照推送跳过：内容与上一条完全一致（去重）")
+                return
         # 经全部推送通道投递（telegram 白名单多 chat / ntfy topic，可同时启用）
+        send_failed = False
         if snap_notifiers:
             for notifier in snap_notifiers:
                 try:
                     await notifier.send(alert.html)
                 except Exception as exc:  # noqa: BLE001 - 单通道失败不影响其他
+                    send_failed = True
                     logger.error("快照推送失败(%s): %s", notifier.describe(), exc)
         else:
+            send_failed = True
             logger.warning("快照推送通道未配置，总览未推送（仅采集落库）")
+        # 只有投递成功才记录去重指纹，失败的下轮允许重试
+        if not send_failed and snapshot_push_cfg.get("dedup", True):
+            await storage.set_state("snap_push:body_hash", body_hash)
         snap_health["snap_last_push"] = datetime.now(
             timezone(timedelta(hours=8))
         ).strftime("%m-%d %H:%M")
 
     async def trigger_snapshot_now() -> None:
-        """/snap now：采集一轮（不补算闭合桶）+ 立即推送。"""
-        await _snapshot_collect_round(snap_collector, markets, backfill=False)
+        """/snap now：立即采集一轮（collect 幂等，含补漏桶/补算）+ 立即推送。"""
+        await _snapshot_collect_round(snap_collector, markets)
         await trigger_snapshot_push()
 
     tasks = [
@@ -419,15 +465,26 @@ async def amain(config_path: str) -> None:
         asyncio.create_task(supervised("pipeline", pipeline.run, stop_event)),
         asyncio.create_task(heartbeat_writer(stop_event)),
         asyncio.create_task(health_watcher(health, rtds, storage, stop_event)),
-        asyncio.create_task(prune_loop(storage, settings, stop_event)),
+        asyncio.create_task(
+            supervised(
+                "prune",
+                lambda: prune_loop(storage, settings, stop_event),
+                stop_event,
+            )
+        ),
     ]
     if markets:
+        collect_interval = int(snapshot_cfg.get("collect_interval_seconds", 600))
         tasks.append(
             asyncio.create_task(
                 supervised(
                     "snapshot_collect",
                     lambda: snapshot_collect_loop(
-                        snap_collector, markets, stop_event, collect_state
+                        snap_collector,
+                        markets,
+                        stop_event,
+                        collect_state,
+                        interval_seconds=collect_interval,
                     ),
                     stop_event,
                 )

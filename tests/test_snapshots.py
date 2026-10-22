@@ -146,7 +146,7 @@ def _row(
     slug_id: str,
     slug: str,
     bucket_ts: int,
-    volume_delta: float = 100.0,
+    volume_shares: float = 100.0,
     trend: str = "up",
     trend_pct: float = 0.021,
     vol_regime: str = "high",
@@ -155,11 +155,14 @@ def _row(
         "slug_id": slug_id,
         "slug": slug,
         "bucket_ts": bucket_ts,
-        "volume_delta": volume_delta,
+        "volume_shares_display": volume_shares,
         "trend": trend,
         "trend_pct": trend_pct,
         "vol_regime": vol_regime,
+        "price_open": 0.50,
         "price_close": 0.63,
+        "price_high": 0.56,
+        "price_low": 0.50,
     }
 
 
@@ -176,11 +179,13 @@ def test_render_summary() -> None:
     assert "kkkkkkk" in body
     assert "clarity-act-signed-into-law-in-2026" not in body
     assert "abcdefg" in body
-    # 两指标
+    # 份额与振幅（(0.56-0.50)/0.50=12.0%）
     assert "量 1,240" in body
     assert "量 312" in body
-    assert "波动 高 📈+2.1%" in body
-    assert "波动 低 ➡️" in body
+    assert "波动 高·12.0%" in body
+    assert "波动 低·12.0%" in body
+    assert "现价 0.6300 📈+2.1%" in body
+    assert "现价 0.6300 ➡️+0.0%" in body
     assert "市场快照" in body
 
 
@@ -194,6 +199,43 @@ def test_render_fallback_slug() -> None:
     alert = render_snapshot_summary(rows, tz_offset_hours=8)
     assert alert is not None
     assert "clarity-act-signed-into-law-in-2026" in alert.html
+
+
+def test_render_summary_healthy_no_stale_warning() -> None:
+    """健康状态：最新闭合桶落后当前桶恰好 1 个，不显示延迟告警。"""
+    now_bucket = (int(time.time()) // 7200) * 7200
+    rows = [_row("aaaa", "slug-a", now_bucket - 7200)]
+    alert = render_snapshot_summary(
+        rows, tz_offset_hours=8, now_bucket=now_bucket
+    )
+    assert alert is not None
+    assert "数据延迟" not in alert.html
+
+
+def test_render_summary_stale_warning() -> None:
+    """采集停摆：最新闭合桶落后 >=2 个桶，标题下必须出现延迟告警。"""
+    now_bucket = (int(time.time()) // 7200) * 7200
+    rows = [_row("aaaa", "slug-a", now_bucket - 9 * 7200)]
+    alert = render_snapshot_summary(
+        rows, tz_offset_hours=8, now_bucket=now_bucket
+    )
+    assert alert is not None
+    assert "数据延迟约 16 小时" in alert.html
+    assert "采集异常" in alert.html
+
+
+def test_render_summary_mixed_buckets_labeled() -> None:
+    """不同市场桶时间不一致时，落后市场的行要标注其所属桶时段。"""
+    now_bucket = (int(time.time()) // 7200) * 7200
+    rows = [
+        _row("aaaa", "slug-a", now_bucket - 3 * 7200),
+        _row("bbbb", "slug-b", now_bucket - 7200),
+    ]
+    alert = render_snapshot_summary(
+        rows, tz_offset_hours=8, now_bucket=now_bucket
+    )
+    assert alert is not None
+    assert "桶）" in alert.html  # 落后的 aaaa 行带桶时段标注
 
 
 # ── 存储 ────────────────────────────────────────────────────────────────
@@ -249,11 +291,34 @@ async def test_snapshot_upsert_idempotent(storage: Storage) -> None:
 
 
 async def test_snapshot_baseline(storage: Storage) -> None:
-    assert await storage.get_snap_baseline("0xcid") is None
-    await storage.set_snap_baseline("0xcid", 1000.0)
-    assert await storage.get_snap_baseline("0xcid") == 1000.0
-    await storage.set_snap_baseline("0xcid", 1200.0)
-    assert await storage.get_snap_baseline("0xcid") == 1200.0
+    bucket = (int(time.time()) // 7200) * 7200
+    assert await storage.get_snap_baseline("0xcid", bucket) is None
+    await storage.set_snap_baseline("0xcid", bucket, 1000.0)
+    assert await storage.get_snap_baseline("0xcid", bucket) == 1000.0
+    await storage.set_snap_baseline("0xcid", bucket, 1200.0)
+    assert await storage.get_snap_baseline("0xcid", bucket) == 1200.0
+    # 不同桶互不影响
+    assert await storage.get_snap_baseline("0xcid", bucket - 7200) is None
+
+
+async def test_update_snapshot_prices_preserves_volume(storage: Storage) -> None:
+    """补齐闭合桶末尾 OHLC 时不得覆盖已结算的成交量。"""
+    now_bucket = (int(time.time()) // 7200) * 7200
+    await storage.upsert_snapshot(
+        **await _sample_snapshot(
+            bucket_ts=now_bucket - 7200, volume_shares=655.0
+        )
+    )
+    await storage.update_snapshot_prices(
+        "0xcid", now_bucket - 7200, 0.40, 0.42, 0.43, 0.39
+    )
+    row = await storage.last_snapshot("0xcid")
+    assert row is not None
+    assert row["price_open"] == 0.40
+    assert row["price_close"] == 0.42
+    assert row["volume_shares"] == 655.0
+    # 桶不存在时静默忽略
+    await storage.update_snapshot_prices("0xcid", now_bucket - 99 * 7200, 1, 1, 1, 1)
 
 
 async def test_latest_complete_buckets(storage: Storage) -> None:

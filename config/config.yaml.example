@@ -47,7 +47,7 @@ display:
 snapshot_push:
   enabled: true                # 是否推送总览（false = 只采集落库）
   mode: "summary"              # summary=合并一条总览（当前实现）
-  schedule:                    # 每天固定北京时间整点，共 7 次
+  schedule:                    # 北京时间推送时刻（同一时刻重复配置会自动去重）
     - "06:00"
     - "09:00"
     - "12:00"
@@ -56,9 +56,12 @@ snapshot_push:
     - "20:00"
     - "24:00"
   timezone_offset_hours: 8     # 北京时间 UTC+8
+  dedup: true                  # 正文与上一条完全一致则抑制（2h 桶配整点推送时，奇数点自动去重）
+  max_stale_buckets: 0         # 最新桶落后超过 N 个桶则跳过推送（0=不跳过，仅在标题提示延迟）
 
 snapshot:
   bucket_seconds: 7200         # 时间桶长度（2h，与参考源一致，勿改）
+  collect_interval_seconds: 600  # 采集间隔（秒），默认 10 分钟；桶内重试 + 漏桶自愈依赖该间隔
   retention_days: 90           # 快照保留天数
   price_fidelity_minutes: 60   # 价格历史采样粒度（分钟）
   wall_min_notional: 100.0     # 订单簿"墙"阈值（USDC）
