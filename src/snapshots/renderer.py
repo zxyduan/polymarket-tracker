@@ -75,14 +75,14 @@ def render_snapshot_summary(
     if not rows:
         return None
 
-    # 桶时段（北京时间）；所有行 bucket_ts 相同则取其一，否则用最早桶
+    # 桶时段（时间）；所有行 bucket_ts 相同则取其一，否则用最早桶
     bucket_ts = min(int(r["bucket_ts"]) for r in rows)
     local_tz = timezone(timedelta(hours=tz_offset_hours))
     start_dt = datetime.fromtimestamp(bucket_ts, tz=local_tz)
     end_dt = datetime.fromtimestamp(bucket_ts + bucket_seconds, tz=local_tz)
     window = f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
 
-    lines: list[str] = [f"📊 市场快照 · {window}（北京时间）"]
+    lines: list[str] = [f"📊 市场快照 · {window}（时间）"]
 
     # 数据延迟告警：健康状态最新闭合桶恰好落后当前桶 1 个；>=2 说明有漏桶
     if now_bucket is not None:

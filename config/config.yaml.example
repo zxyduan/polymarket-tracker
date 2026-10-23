@@ -49,7 +49,7 @@ events:
   retention_days: 180
   notifications_retention_days: 30   # 推送记录保留时长
 
-# 展示时区（北京时间 UTC+8）
+# 展示时区（时间 UTC+8）
 display:
   timezone_offset_hours: 8
 
@@ -57,7 +57,7 @@ display:
 snapshot_push:
   enabled: true                # 是否推送总览（false = 只采集落库）
   mode: "summary"              # summary=合并一条总览（当前实现）
-  schedule:                    # 北京时间推送时刻（同一时刻重复配置会自动去重）
+  schedule:                    # 时间推送时刻（同一时刻重复配置会自动去重）
     - "06:00"
     - "09:00"
     - "12:00"
@@ -65,7 +65,7 @@ snapshot_push:
     - "18:00"
     - "20:00"
     - "24:00"
-  timezone_offset_hours: 8     # 北京时间 UTC+8
+  timezone_offset_hours: 8     # 时间 UTC+8
   dedup: true                  # 正文与上一条完全一致则抑制（2h 桶配整点推送时，奇数点自动去重）
   max_stale_buckets: 0         # 最新桶落后超过 N 个桶则跳过推送（0=不跳过，仅在标题提示延迟）
 

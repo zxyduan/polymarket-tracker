@@ -170,7 +170,7 @@ async def _snapshot_collect_round(
 
 
 def _parse_snapshot_schedule(schedule: list[str]) -> list[tuple[int, int, str]]:
-    """解析北京时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。
+    """解析时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。
 
     同一时刻（含 00:00 与 24:00 并存）只保留一条，防止午夜/重复配置双推。
     """
@@ -203,7 +203,7 @@ async def snapshot_push_loop(
     trigger_push: Any,
     stop_event: asyncio.Event,
 ) -> None:
-    """按配置的北京时间整点推送总览；已推过的整点不重推，错过的整点不补推。
+    """按配置的时间整点推送总览；已推过的整点不重推，错过的整点不补推。
 
     重复内容由 trigger_snapshot_push 的 dedup 再去一层（2h 桶配整点推送时，
     奇数点内容相同会被抑制）。

@@ -10,7 +10,7 @@ from src.snapshots.renderer import render_market_list, render_tracker_status
 
 SNAP_HELP = (
     "<b>市场快照推送</b>\n"
-    "每 2 小时采集自选市场，北京时间 06/09/12/15/18/20/24 推送总览\n"
+    "每 2 小时采集自选市场，时间 06/09/12/15/18/20/24 推送总览\n"
     "支持指令：\n"
     "/snap now — 立即采集一轮并推送\n"
     "/vol — RTDS 成交量记账实时状态\n"
