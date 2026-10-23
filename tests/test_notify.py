@@ -80,7 +80,7 @@ async def test_ntfy_send_posts_text(monkeypatch: Any, tmp_path: Path) -> None:
         "https://ntfy.sh/",
         "poly-test",
         access_token="tok123",
-        title_prefix="Polymarket",
+        title_prefix="market",
         priority="4",
         tags="chart, robot",
     )
@@ -90,7 +90,7 @@ async def test_ntfy_send_posts_text(monkeypatch: Any, tmp_path: Path) -> None:
     assert url == "https://ntfy.sh/poly-test"
     assert content == "<b>hello</b>"
     assert headers["Authorization"] == "Bearer tok123"
-    assert headers["X-Title"] == "Polymarket"
+    assert headers["X-Title"] == "market"
     assert headers["X-Priority"] == "4"
     assert headers["X-Tags"] == "chart,robot"
     assert "poly-test" in n.describe()

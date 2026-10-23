@@ -604,7 +604,7 @@ async def amain(config_path: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Polymarket 交易员监控")
+    parser = argparse.ArgumentParser(description="market 交易员监控")
     parser.add_argument("--config", default="config/config.yaml")
     args = parser.parse_args()
     try:

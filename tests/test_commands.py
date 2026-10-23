@@ -21,7 +21,7 @@ async def handler(tmp_path: Path) -> CommandHandler:
 
 async def test_help(handler: CommandHandler) -> None:
     reply = await handler("/help", 1)
-    assert reply is not None and "Polymarket" in reply
+    assert reply is not None and "market" in reply
 
 
 async def test_add_invalid(handler: CommandHandler) -> None:

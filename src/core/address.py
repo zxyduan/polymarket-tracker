@@ -45,7 +45,7 @@ def compute_create2(factory: str, salt: bytes, init_code: bytes) -> str:
 def derive_safe_proxy(eoa: str, factory: str, proxy_init_code: str) -> str | None:
     """用 EOA 作为 salt 派生 Gnosis Safe 代理钱包。
 
-    与 Polymarket 官方工厂"以 EOA 为 salt"的约定一致。init_code 为空时返回 None。
+    与 market 官方工厂"以 EOA 为 salt"的约定一致。init_code 为空时返回 None。
     """
     if not proxy_init_code.strip():
         return None

@@ -8,7 +8,7 @@ from src.core.address import is_address
 from src.core.renderer import html_escape
 
 HELP_TEXT = (
-    "<b>Polymarket 交易员监控</b>\n"
+    "<b>market 交易员监控</b>\n"
     "支持指令：\n"
     "/add 0x地址 名称 — 新增监控（可加多个）\n"
     "/remove 0x地址 — 移除监控\n"

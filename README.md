@@ -1,10 +1,10 @@
-# Polymarket 交易员监控与消息推送
+# market 交易员监控与消息推送
 
-监控一个或多个 Polymarket 交易员地址，交易员发生成交后，实时将市场、方向、价格、数量、金额推送至 Telegram（安卓手机）。RTDS 实时通道 + Data API 对账兜底，断线不遗漏、不重复。
+监控一个或多个 market 交易员地址，交易员发生成交后，实时将市场、方向、价格、数量、金额推送至 Telegram（安卓手机）。RTDS 实时通道 + Data API 对账兜底，断线不遗漏、不重复。
 
 ## 工作原理
 
-- Polymarket 采用"链下撮合、链上结算"：成交由官方中继批量提交，交易员地址不在交易 `from/to`，因此**不能**用常规链上地址监控，必须走官方索引数据；
+- market 采用"链下撮合、链上结算"：成交由官方中继批量提交，交易员地址不在交易 `from/to`，因此**不能**用常规链上地址监控，必须走官方索引数据；
 - L1 实时层：RTDS WebSocket（`wss://ws-live-data.polymarket.com`）订阅活动流，按 `proxyWallet` 过滤；
 - L2 兜底层：Data API 每 60 秒对账，补齐漏发与断线缺口；
 - 统一去重键 `txHash:logIndex`，同笔结算多笔成交合并为一条；
@@ -23,7 +23,7 @@ cp .env.example .env
 # 编辑 .env，填入 BOT_TOKEN；ALLOWED_CHAT_IDS 可留空（首个 /start 用户自动成为管理员）
 ```
 
-编辑 `config/config.yaml`，在 `watchlist` 中配置一个或多个交易员地址（推荐填 Polymarket 个人主页/排行榜上的地址）：
+编辑 `config/config.yaml`，在 `watchlist` 中配置一个或多个交易员地址（推荐填 market 个人主页/排行榜上的地址）：
 
 ```yaml
 watchlist:
@@ -74,7 +74,7 @@ Will X happen before 2027?
 ## EC2 部署要点
 
 - 实例：t4g.micro / t3.micro 即可；安全组入站全部拒绝，出站 443；建议用 SSM 维护；
-- 区域：选择可正常访问 Polymarket API 的区域，部署前验证；
+- 区域：选择可正常访问 market API 的区域，部署前验证；
 - 数据持久化：`data/` 目录（SQLite），注意备份。
 
 ## 目录结构

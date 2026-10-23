@@ -1,5 +1,5 @@
-# Polymarket 交易员监控配置
-# 配置说明：watchlist 支持配置多个交易员地址，推荐填写 Polymarket 个人主页/排行榜上的地址（代理钱包）。
+# market 交易员监控配置
+# 配置说明：watchlist 支持配置多个交易员地址，推荐填写 market 个人主页/排行榜上的地址（代理钱包）。
 # 运行后也可通过 Telegram 指令 /add、/remove 动态增删，动态名单存入 SQLite，本文件只做启动种子。
 
 watchlist:
@@ -99,7 +99,7 @@ ntfy:
   topic: "polymarket-alerts"     # 交易员告警 topic（订阅端 App 需订阅同名 topic）
   snapshot_topic: "polymarket-snap"  # 快照总览 topic（缺省则用 topic）
   access_token: ""               # 可选：私有 topic / 自建服务器鉴权（发布需 Bearer token）
-  title_prefix: "Polymarket"     # 可选：推送标题前缀
+  title_prefix: "market"     # 可选：推送标题前缀
   priority: ""                   # 可选：1-5（如 3=默认、4=高优先级）
   tags: ""                       # 可选：英文逗号分隔，如 "chart,robot"
 

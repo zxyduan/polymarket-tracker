@@ -15,7 +15,7 @@ SNAP_HELP = (
     "/snap now — 立即采集一轮并推送\n"
     "/vol — RTDS 成交量记账实时状态\n"
     "/list — 查看监控市场\n"
-    "/add &lt;slug&gt; [slug_id] — 新增盘口（slug 为 Polymarket 市场完整 slug）\n"
+    "/add &lt;slug&gt; [slug_id] — 新增盘口（slug 为 market 市场完整 slug）\n"
     "/remove &lt;slug_id|slug&gt; — 删除盘口\n"
     "/status — 查看快照服务状态\n"
     "/help — 帮助"
@@ -84,7 +84,7 @@ class SnapshotCommandHandler:
             return (
                 "<b>/add 用法</b>\n"
                 "/add &lt;slug&gt; [slug_id]\n"
-                "slug：Polymarket 市场完整 slug（如 clarity-act-signed-into-law-in-2026）\n"
+                "slug：market 市场完整 slug（如 clarity-act-signed-into-law-in-2026）\n"
                 "slug_id：推送中显示的短码，不填则用 slug"
             )
         slug = args[0].strip().lower()
@@ -99,7 +99,7 @@ class SnapshotCommandHandler:
         if not resolved:
             return (
                 f"❌ 解析失败：{slug}\n"
-                "确认 slug 正确（Polymarket 页面 URL 末尾），或稍后重试"
+                "确认 slug 正确（market 页面 URL 末尾），或稍后重试"
             )
         condition_id, _ = resolved
 
