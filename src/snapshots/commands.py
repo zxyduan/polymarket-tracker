@@ -18,6 +18,7 @@ SNAP_HELP = (
     "/add &lt;slug&gt; [slug_id] — 新增盘口（slug 为 market 市场完整 slug）\n"
     "/remove &lt;slug_id|slug&gt; — 删除盘口\n"
     "/status — 查看快照服务状态\n"
+    "/daily now — 立即生成并推送每日成交份额汇总\n"
     "/help — 帮助"
 )
 
@@ -33,6 +34,9 @@ class SnapshotCommandHandler:
         trigger_snapshot: Callable[[], Awaitable[None]],
         health: dict[str, Any],
         markets_path: str | None = None,
+        *,
+        trigger_daily: Callable[[], Awaitable[str]] | None = None,
+        daily_health: dict[str, Any] | None = None,
     ) -> None:
         self.markets = markets
         self.collector = collector
@@ -40,6 +44,8 @@ class SnapshotCommandHandler:
         self.trigger_snapshot = trigger_snapshot
         self.health = health
         self.markets_path = markets_path
+        self.trigger_daily = trigger_daily
+        self.daily_health = daily_health
 
     async def __call__(self, text: str, chat_id: int) -> str | None:
         parts = text.strip().split()
@@ -61,7 +67,20 @@ class SnapshotCommandHandler:
             return await self._add_market(parts[1:])
         if command == "/remove":
             return await self._remove_market(parts[1:])
+        if command == "/daily":
+            return await self._daily_now(parts[1:])
         return "未识别指令，发送 /help 查看可用指令"
+
+    async def _daily_now(self, args: list[str]) -> str:
+        """/daily now：立即生成并推送一次日报；写入当日 state，参与防重。"""
+        if self.trigger_daily is None:
+            return "日报功能未接入"
+        if args and args[0].lower() != "now":
+            return "用法：/daily now"
+        result = await self.trigger_daily()
+        if self.daily_health is not None:
+            self.daily_health["daily_result"] = result
+        return daily_result_reply(result)
 
     async def _snap_now(self) -> str:
         await self.trigger_snapshot()
@@ -153,3 +172,54 @@ class SnapshotCommandHandler:
             f"🗑️ 已删除盘口：{removed.slug_id}（{removed.slug}）\n"
             "已落盘，重启后仍生效；历史快照数据保留"
         )
+
+
+# ── 每日成交份额汇总指令 ────────────────────────────────────────────────
+
+
+def daily_result_reply(result: str) -> str:
+    """把 trigger_daily_report 结果码映射为用户可见回执（两套 handler 共用）。"""
+    return {
+        "sent": "✅ 日报已推送",
+        "degraded": "⚠️ 日报已推送（降级正文）",
+        "selfcheck_failed": "❌ 单调自检未通过，日报已拒发（见日志）",
+        "sent_dup": "ℹ️ 正文与上一条完全一致，已抑制",
+        "send_failed": "❌ 日报发送失败，可稍后重试",
+    }.get(result, f"日报结果：{result}")
+
+
+DAILY_HELP = (
+    "<b>每日成交份额汇总</b>\n"
+    "/daily now — 立即生成并推送一次日报\n"
+    "/help — 帮助"
+)
+
+
+class DailyCommandHandler:
+    """独立日报 Bot 的指令处理（不暴露 /snap /vol /add 等快照指令）。"""
+
+    def __init__(
+        self,
+        *,
+        trigger_daily: Callable[[], Awaitable[str]],
+        daily_health: dict[str, Any] | None = None,
+    ) -> None:
+        self.trigger_daily = trigger_daily
+        self.daily_health = daily_health
+
+    async def __call__(self, text: str, chat_id: int) -> str | None:
+        parts = text.strip().split()
+        if not parts:
+            return DAILY_HELP
+        command = parts[0].split("@")[0].lower()
+
+        if command in ("/start", "/help"):
+            return DAILY_HELP
+        if command == "/daily":
+            if parts[1:] and parts[1].lower() != "now":
+                return "用法：/daily now"
+            result = await self.trigger_daily()
+            if self.daily_health is not None:
+                self.daily_health["daily_result"] = result
+            return daily_result_reply(result)
+        return "未识别指令，发送 /help 查看可用指令"

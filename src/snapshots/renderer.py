@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -133,13 +134,6 @@ def render_market_list(markets: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def _fmt_shares(value: float | None) -> str:
-    """份额显示：0 = 真实零成交显示 0；-1 = 未知（RTDS 未记账）显示 -。"""
-    if value is None or (isinstance(value, (int, float)) and value < 0):
-        return "-"
-    return f"{value:,.0f}"
-
-
 async def render_tracker_status(storage: Any, collector: Any) -> str:
     """成交量实时状态（/vol，v10 基线差口径，免等 2h 验证链路）。
 
@@ -174,3 +168,83 @@ async def render_tracker_status(storage: Any, collector: Any) -> str:
         prev_s = _fmt_shares(prev_sh)
         lines.append(f"{slug_id}｜{cur_s}｜{prev_s}")
     return "\n".join(lines)
+
+
+# ── 每日成交份额汇总（日报）─────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class DailyReport:
+    """日报纯渲染产物；分段、续段标题、footer 归属由触发层处理（S9）。"""
+
+    title: str                 # 首段标题（不含"（续 i/n）"）
+    market_lines: list[str]    # 全部市场行（已排序、已 top_n 截断）
+    footer: str                # 统计区间尾注（只附末段）
+    truncated_note: str        # top_n 截断提示；未截断为空串
+    total: int                 # 参与排序的市场总数（截断前）
+
+
+def _daily_index(i: int) -> str:
+    """序号显示：1–9 用键帽 emoji（与快照总览风格一致），≥10 回退普通数字。"""
+    if 1 <= i <= 9:
+        return f"{i}️⃣"
+    return f"{i}."
+
+
+def render_daily_volume_report(
+    rows: list[dict[str, Any]],
+    *,
+    windows_days: list[int],
+    now_bucket: int,
+    tz_offset_hours: int,
+    top_n: int,
+) -> DailyReport | None:
+    """把合并后的三窗口份额行渲染为日报结构；rows 为空返回 None。
+
+    纯函数：不排序入参副作用（内部另建列表）、不发送、不感知分段。
+    rows 每行需含 condition_id / slug_id / slug 及 shares_{d}d 各档份额。
+    """
+    if not rows:
+        return None
+
+    primary = f"shares_{windows_days[0]}d"
+    ordered = sorted(
+        rows,
+        key=lambda r: (-float(r.get(primary, 0.0) or 0.0), str(r.get("condition_id", ""))),
+    )
+    total = len(ordered)
+
+    truncated_note = ""
+    if top_n > 0 and total > top_n:
+        display = ordered[:top_n]
+        truncated_note = f"其余 {total - top_n} 个市场未列出"
+    else:
+        display = ordered
+
+    local_tz = timezone(timedelta(hours=tz_offset_hours))
+    r_local = datetime.fromtimestamp(now_bucket, tz=local_tz)
+    title = f"📈 每日成交份额汇总 · {r_local.month}月{r_local.day}日（截至今晨06:00）"
+
+    market_lines: list[str] = []
+    for i, row in enumerate(display, 1):
+        label = html_escape(str(row.get("slug_id") or row.get("slug") or "?"))
+        parts = [
+            f"{d}天 {_fmt_shares(float(row.get(f'shares_{d}d', 0.0) or 0.0))}"
+            for d in windows_days
+        ]
+        market_lines.append(f"{_daily_index(i)} {label}\n   " + "｜".join(parts))
+
+    start_bucket = now_bucket - max(windows_days) * 86400
+    footer = (
+        f"共 {total} 个市场｜区间 "
+        f"{datetime.fromtimestamp(start_bucket, tz=local_tz):%m-%d %H:%M} ~ "
+        f"{r_local:%m-%d %H:%M}（UTC{tz_offset_hours:+d}）"
+    )
+
+    return DailyReport(
+        title=title,
+        market_lines=market_lines,
+        footer=footer,
+        truncated_note=truncated_note,
+        total=total,
+    )

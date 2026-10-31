@@ -52,10 +52,18 @@ def _build_ntfy(
 ) -> NtfyNotifier | None:
     ntfy_cfg = settings.ntfy
     server = str(ntfy_cfg.get("server", "https://ntfy.sh")).strip()
-    topic_key = "snapshot_topic" if kind == "snapshot" else "topic"
-    topic = str(ntfy_cfg.get(topic_key, "")).strip() or str(
-        ntfy_cfg.get("topic", "")
-    ).strip()
+    if kind == "daily":
+        # 日报独立 topic：缺失即禁用日报 ntfy 通道，不回退 snapshot_topic/topic
+        topic_key = "daily_topic"
+        topic = str(ntfy_cfg.get("daily_topic", "")).strip()
+    elif kind == "snapshot":
+        topic_key = "snapshot_topic"
+        topic = str(ntfy_cfg.get(topic_key, "")).strip() or str(
+            ntfy_cfg.get("topic", "")
+        ).strip()
+    else:
+        topic_key = "topic"
+        topic = str(ntfy_cfg.get(topic_key, "")).strip()
     if not topic:
         logger.warning(
             "notify 含 ntfy 但 [ntfy] 未配置 %s，%s 推送禁用", topic_key, kind

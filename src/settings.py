@@ -161,6 +161,16 @@ class Settings:
         return os.getenv("SNAPSHOT_BOT_TOKEN", "").strip()
 
     @property
+    def daily_bot_token(self) -> str:
+        """独立日报 Bot token（环境变量 DAILY_BOT_TOKEN；空 = 复用快照 Bot）。"""
+        return os.getenv("DAILY_BOT_TOKEN", "").strip()
+
+    @property
+    def daily_report(self) -> dict[str, Any]:
+        """daily_report 配置节（日报调度与展示参数）。"""
+        return self.section("daily_report")
+
+    @property
     def notify_platforms(self) -> list[str]:
         """推送平台列表（可多个同时启用）：telegram | ntfy，缺省 ["telegram"]。
 
@@ -213,3 +223,140 @@ class Settings:
                 return default
             node = node[part]
         return node
+
+
+@dataclass(frozen=True)
+class DailyReportConfig:
+    """daily_report 节解析结果（含校验输出）。"""
+
+    enabled: bool
+    time_hour: int
+    time_minute: int
+    timezone_offset_hours: int
+    windows_days: list[int]
+    bucket_seconds: int
+    top_n: int
+    page_size: int
+    segment_delay_seconds: float
+    dedup: bool
+    errors: list[str] = field(default_factory=list)      # 致命：禁用日报任务
+    warnings: list[str] = field(default_factory=list)    # 不阻断，仅日志
+
+
+def resolve_daily_config(settings: Settings) -> DailyReportConfig:
+    """读取并校验 daily_report 节。
+
+    致命错误不抛异常，返回 enabled=False + errors，由 amain 层跳过任务
+    注册（fail-fast 仅禁用本任务，不拖垮主服务）。
+    """
+    raw = settings.daily_report
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    enabled = bool(raw.get("enabled", True))
+
+    # time 解析（风格对齐 main._parse_snapshot_schedule；拒绝 24:00）
+    time_str = str(raw.get("time", "07:00")).strip()
+    time_hour, time_minute = 7, 0
+    try:
+        h_str, m_str = time_str.split(":")
+        time_hour, time_minute = int(h_str), int(m_str)
+        if not (0 <= time_hour <= 23 and 0 <= time_minute <= 59):
+            raise ValueError("hour/minute out of range")
+    except (ValueError, IndexError):
+        errors.append(
+            f"daily_report.time 非法: {time_str!r}（HH:MM，0–23 时，不支持 24:00）"
+        )
+        time_hour, time_minute = 7, 0
+
+    tz = raw.get(
+        "timezone_offset_hours",
+        settings.get("display.timezone_offset_hours", 8),
+    )
+    try:
+        timezone_offset_hours = int(tz)
+    except (TypeError, ValueError):
+        errors.append(f"daily_report.timezone_offset_hours 非法: {tz!r}")
+        timezone_offset_hours = 8
+
+    try:
+        windows_days = [int(x) for x in (raw.get("windows_days") or [1, 3, 7])]
+    except (TypeError, ValueError):
+        errors.append("daily_report.windows_days 必须为整数列表")
+        windows_days = []
+    if not windows_days or any(d <= 0 for d in windows_days) or (
+        windows_days != sorted(windows_days)
+    ):
+        errors.append("daily_report.windows_days 必须为非空正整数且严格升序")
+
+    # bucket_seconds 必须纳入统一错误收集：非数字 / 0 / 负数都不能抛异常拖垮
+    # 主服务（fail-fast 仅禁用日报）；取值后先判正整数，再参与整除/取模判断。
+    try:
+        bucket_seconds = int(
+            raw.get("bucket_seconds", settings.snapshot.get("bucket_seconds", 7200))
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(f"daily_report.bucket_seconds 非法: {exc}")
+        bucket_seconds = 7200
+    if bucket_seconds <= 0:
+        errors.append("daily_report.bucket_seconds 必须为正整数")
+        bucket_seconds = 7200
+
+    if windows_days:
+        if any((d * 86400) % bucket_seconds != 0 for d in windows_days):
+            errors.append("daily_report 窗口天数必须能被 bucket_seconds 整除")
+        snap_bucket = settings.snapshot.get("bucket_seconds")
+        if snap_bucket is not None:
+            # 快照节自身非法由快照配置校验负责；这里只做容忍性比较，不重复抛错。
+            try:
+                if int(snap_bucket) != bucket_seconds:
+                    warnings.append(
+                        "daily_report.bucket_seconds 与 snapshot.bucket_seconds 不一致"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+    try:
+        top_n = int(raw.get("top_n", 0))
+        page_size = int(raw.get("page_size", 20))
+        segment_delay_seconds = float(raw.get("segment_delay_seconds", 0.4))
+    except (TypeError, ValueError) as exc:
+        errors.append(f"daily_report 数值参数非法: {exc}")
+        top_n, page_size, segment_delay_seconds = 0, 20, 0.4
+    dedup = bool(raw.get("dedup", True))
+
+    if top_n < 0:
+        errors.append("daily_report.top_n 不能为负（0 = 不限制）")
+    if page_size < 1:
+        errors.append("daily_report.page_size 必须 ≥ 1")
+    if segment_delay_seconds < 0:
+        errors.append("daily_report.segment_delay_seconds 不能为负")
+
+    # 保留期警告用 prune_loop 实际生效值（settings.snapshot.retention_days）；
+    # collector.RETENTION_DAYS 是采集器内部第二套清理口径，本校验不读它。
+    # 同样纳入容错：快照节保留期非数字时回退 90，不向启动流程抛异常。
+    try:
+        retention_days = int(settings.snapshot.get("retention_days", 90))
+    except (TypeError, ValueError):
+        retention_days = 90
+    if retention_days <= 0:
+        retention_days = 90
+    if windows_days and bucket_seconds > 0 and max(windows_days) * 86400 // bucket_seconds > (
+        retention_days * 86400 // bucket_seconds
+    ):
+        warnings.append("最长窗口超过快照保留期，早期桶可能已被清理")
+
+    return DailyReportConfig(
+        enabled=enabled and not errors,
+        time_hour=time_hour,
+        time_minute=time_minute,
+        timezone_offset_hours=timezone_offset_hours,
+        windows_days=windows_days,
+        bucket_seconds=bucket_seconds,
+        top_n=top_n,
+        page_size=page_size,
+        segment_delay_seconds=segment_delay_seconds,
+        dedup=dedup,
+        errors=errors,
+        warnings=warnings,
+    )

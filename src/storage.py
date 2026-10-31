@@ -574,3 +574,66 @@ class Storage:
         await self._execute(
             "DELETE FROM market_snapshots WHERE bucket_ts < ?", (cutoff,)
         )
+
+    # ---- 每日成交份额汇总（日报专用只读查询）----
+
+    async def volume_by_window(self, start_ts: int, end_ts: int) -> list[dict[str, Any]]:
+        """窗口 [start_ts, end_ts) 内各市场成交份额聚合（仅份额口径）。
+
+        返回窗口内至少有一行的市场：
+          condition_id, slug, slug_id,
+          shares  = SUM(volume_shares >= 0 的桶)  # -1 未知桶与缺失行贡献 0
+          buckets = 命中行数（仅供日志诊断，不进正文）
+
+        时间过滤与聚合全部在 SQL 内完成（复用 idx_snap_time）；
+        报表显示名以调用方 markets.toml 为准，这里的历史 slug 仅诊断用。
+        """
+        rows = await self._fetchall(
+            """
+            SELECT condition_id,
+                   MAX(slug)    AS slug,
+                   MAX(slug_id) AS slug_id,
+                   SUM(CASE WHEN volume_shares >= 0 THEN volume_shares
+                            ELSE 0 END) AS shares,
+                   COUNT(*) AS buckets
+            FROM market_snapshots
+            WHERE bucket_ts >= ? AND bucket_ts < ?
+            GROUP BY condition_id
+            """,
+            (start_ts, end_ts),
+        )
+        return [dict(row) for row in rows]
+
+    async def latest_notification_id(self) -> int:
+        """当前 notifications 表最大自增 id（日报发送前的水位起点）。"""
+        row = await self._fetchone("SELECT MAX(id) AS max_id FROM notifications")
+        if row is None or row["max_id"] is None:
+            return 0
+        return int(row["max_id"])
+
+    async def count_notifications_since(
+        self, after_id: int, event_key: str
+    ) -> dict[str, int]:
+        """统计 id > after_id 且归属 event_key 的 success / failed 条数。
+
+        notifications 表为全任务共用，event_keys 为逗号拼接字符串，
+        用 LIKE 子串匹配做归属隔离：同时刻交易员摘要、快照推送的落痕
+        因 key 不同被排除，故日报成败判定不受其他任务影响。
+        """
+        like = f"%{event_key}%"
+        row = await self._fetchone(
+            """
+            SELECT
+              SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+              SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed
+            FROM notifications
+            WHERE id > ? AND event_keys LIKE ?
+            """,
+            (after_id, like),
+        )
+        if row is None:
+            return {"success": 0, "failed": 0}
+        return {
+            "success": int(row["success"] or 0),
+            "failed": int(row["failed"] or 0),
+        }
