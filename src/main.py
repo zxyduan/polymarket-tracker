@@ -656,6 +656,7 @@ async def amain(config_path: str) -> None:
 
     # 日报通道与状态（延迟装配，模式对齐 snap_notifiers；闭包调用时才读取列表内容）
     daily_notifiers: list[Notifier] = []
+    _p1_daily_uc = None  # P1 usecase 装配后替换
     daily_health: dict[str, Any] = {"daily_last_push": "-", "daily_result": "-"}
     daily_cfg = resolve_daily_config(settings)
     for _warn in daily_cfg.warnings:
@@ -763,6 +764,8 @@ async def amain(config_path: str) -> None:
 
     async def _fire_daily_report() -> str:
         """amain 层薄封装：日报流程显式注入依赖，notifiers 调用时才取最新装配。"""
+        if _p1_daily_uc is not None:
+            return await _p1_daily_uc.run()
         return await trigger_daily_report(
             storage=storage,
             collector=snap_collector,
@@ -1026,6 +1029,47 @@ async def amain(config_path: str) -> None:
                 health=snap_health,
             )
             logger.info("P1 快照 usecase 已接管推送")
+
+            from features.daily_report.usecase import (
+                DailyReportConfig, DailyReportUsecase,
+            )
+            from src.main import render_daily_volume_report  # 同模块内
+
+            class _DailyRenderer:
+                def render(self, rows, *, windows_days, now_bucket,
+                           tz_offset_hours, top_n):
+                    rep = render_daily_volume_report(
+                        rows, windows_days=windows_days, now_bucket=now_bucket,
+                        tz_offset_hours=tz_offset_hours, top_n=top_n,
+                    )
+                    if rep is None:
+                        return None
+                    body = rep.title + "\n" + "\n".join(rep.market_lines)
+                    if rep.footer:
+                        body += "\n" + rep.footer
+                    return RenderedMessage(body=body)
+
+            daily_router = ChannelRouter(
+                [NotifierChannel(n) for n in daily_notifiers],
+                type("_P", (), {"targets": staticmethod(lambda: [])})(),
+            )
+            _p1_daily_uc = DailyReportUsecase(
+                catalog=_Catalog(),
+                query=SnapshotStore(storage),
+                renderer=_DailyRenderer(),
+                router=daily_router,
+                paginator=MessagePaginator(),
+                body_hash=guard,
+                config=DailyReportConfig(
+                    windows_days=list(daily_cfg.windows_days),
+                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
+                    top_n=daily_cfg.top_n,
+                    page_size=daily_cfg.page_size,
+                    now_bucket=_current_bucket_start(),
+                ),
+                health=daily_health,
+            )
+            logger.info("P1 日报 usecase 已接管")
     except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
         logger.exception("P1 bootstrap 装配失败，回退旧链路")
 
