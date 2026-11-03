@@ -9,10 +9,15 @@ class _Prov:
     def targets(self): return []
 
 
-def test_build_runtime_registers_disabled_features():
-    rt = build_runtime(storage=None, cfg=None, channels=[],
-                       provider=_Prov(), health={})
-    names = [m.name for m in rt.modules]
-    assert names == ["market_snapshot", "daily_report"]
+def test_build_runtime_switch_off():
+    rt = build_runtime(storage=None, channels=[], provider=_Prov(), health={})
     assert all(not m.enabled for m in rt.modules)
-    asyncio.run(rt.run_enabled())  # disabled → 不跑、不报错
+    asyncio.run(rt.run_enabled())
+
+
+def test_build_runtime_switch_on_needs_deps():
+    # switch=True 但没传 collector/renderer → 仍降级 noop，不崩
+    rt = build_runtime(storage=None, channels=[], provider=_Prov(),
+                       health={}, switch=True)
+    assert all(m.enabled for m in rt.modules)
+    asyncio.run(rt.run_enabled())
