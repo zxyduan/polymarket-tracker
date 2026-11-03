@@ -1,0 +1,104 @@
+diff --git a/debug_trader_push.py b/debug_trader_push.py
+new file mode 100644
+index 0000000..b08f863
+--- /dev/null
++++ b/debug_trader_push.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""trader 推送链路诊断脚本。
++
++用法：
++    cd /home/ec2-user/polymarket-tracker
++    source .venv/bin/activate
++    python debug_trader_push.py
++"""
++
++import asyncio
++import logging
++import sys
++
++logging.basicConfig(
++    level=logging.INFO,
++    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
++    stream=sys.stdout,
++)
++# 打开 pipeline 和 bot 的 debug 日志
++for name in ["src.core.pipeline", "src.bot", "src.core.aggregator"]:
++    logging.getLogger(name).setLevel(logging.DEBUG)
++
++from framework.app import build_app, shutdown_app
++
++
++async def diagnose():
++    print("=" * 60)
++    print("trader 推送链路诊断（监听 60 秒）")
++    print("=" * 60)
++
++    h = await build_app("config/config.yaml")
++    print(f"\n✅ app 构建成功")
++    print(f"   p1 keys: {list(h.p1.keys())}")
++
++    pipeline = h.pipeline
++    in_q = pipeline.in_queue   # event_queue：RTDS 事件进来
++    out_q = pipeline.out_queue  # message_queue：推送消息出去
++
++    print(f"\n[链路队列]")
++    print(f"   in_queue (RTDS→pipeline) size: {in_q.qsize()}")
++    print(f"   out_queue (pipeline→ntfy) size: {out_q.qsize()}")
++
++    print(f"\n[60 秒事件监听开始...]")
++    in_count = 0
++    out_count = 0
++    start = asyncio.get_event_loop().time()
++
++    while (asyncio.get_event_loop().time() - start) < 60:
++        # in_queue 有事件？
++        if not in_q.empty():
++            evt = in_q.get_nowait()
++            in_count += 1
++            print(f"  📥 [in] type={evt.event_type} wallet={evt.wallet[:12]} size={evt.size} price={evt.price}")
++            # 放回，让 pipeline 自己处理
++            await in_q.put(evt)
++            in_q.task_done()
++
++        # out_queue 有推送？
++        if not out_q.empty():
++            msg = out_q.get_nowait()
++            out_count += 1
++            title = getattr(msg, 'title', '') or getattr(msg, 'html', '')[:60]
++            print(f"  📤 [out] 推送消息: {title[:80]}")
++            # 手动发一次验证通道
++            for n in h.p1.get('trader', []):
++                pass  # trader 是 usecase，不是 notifier list
++            # 直接调 trader usecase 的 handle
++            print(f"  ✅ pipeline 产出了推送消息，说明 pipeline 正常")
++            out_q.task_done()
++
++        await asyncio.sleep(0.3)
++
++    print(f"\n{'='*60}")
++    print(f"60 秒统计:")
++    print(f"  RTDS 事件进 pipeline: {in_count}")
++    print(f"  pipeline 产出推送: {out_count}")
++    print()
++
++    if in_count == 0:
++        print("❌ 问题在最上游：RTDS WebSocket 连上了，但没收到任何事件")
++        print("   可能原因：")
++        print("   1. 监控地址没成交（你说有成交，那就是地址不对）")
++        print("   2. RTDS 订阅的地址列表不对")
++        print("   3. 事件被 filters 配置过滤了（event_types / min_notional）")
++    elif out_count == 0:
++        print("❌ 问题在 pipeline：事件进来了，但没产出推送")
++        print("   可能原因：")
++        print("   1. aggregator 聚合窗口内没攒够")
++        print("   2. 去重逻辑把事件吃掉了")
++        print("   3. trader renderer 渲染返回 None")
++    else:
++        print("✅ 链路正常，应该能收到推送")
++
++    await shutdown_app(h)
++
++
++if __name__ == "__main__":
++    asyncio.run(diagnose())
