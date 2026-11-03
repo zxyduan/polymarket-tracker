@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from src.bot.auth import AuthManager
 from src.bot.commands import CommandHandler
-from src.bot.telegram import BotRunner, TelegramApi, run_sender
+from src.bot.telegram import BotRunner, TelegramApi
 from src.core.models import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
