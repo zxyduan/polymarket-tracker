@@ -1,0 +1,59 @@
+From 20d25500af87a5b0f510782a78546caba038018b Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 14:35:22 +0800
+Subject: [PATCH] docs(p6): config.example daily_report + FEATURE_RULES.md
+
+---
+ config/config.yaml.example | 10 ++++++++++
+ doc/FEATURE_RULES.md       | 18 ++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+ create mode 100644 doc/FEATURE_RULES.md
+
+diff --git a/config/config.yaml.example b/config/config.yaml.example
+index bd5eb18..1f3408e 100644
+--- a/config/config.yaml.example
++++ b/config/config.yaml.example
+@@ -77,6 +77,16 @@ snapshot:
+   wall_min_notional: 100.0     # 订单簿"墙"阈值（USDC）
+   request_timeout_seconds: 15
+ 
++# 日报：当日成交份额汇总推送
++daily_report:
++  enabled: true
++  schedule: "08:00"             # 每日推送时刻
++  windows_days: [1, 7, 30]      # 窗口天数
++  timezone_offset_hours: 8
++  top_n: 10                     # Top N 市场
++  page_size: 20
++  dedup: true
++
+ # 服务端点（集中配置，接口变更只改这里）
+ endpoints:
+   rtds: "wss://ws-live-data.polymarket.com"
+diff --git a/doc/FEATURE_RULES.md b/doc/FEATURE_RULES.md
+new file mode 100644
+index 0000000..8903d1e
+--- /dev/null
++++ b/doc/FEATURE_RULES.md
+@@ -0,0 +1,18 @@
++# FEATURE_RULES.md
++
++## F1 交易员告警
++- 输入：RTDS activity 成交事件
++- 流程：AlertMessage → LegacyTraderRenderer → ChannelRouter
++- 节奏：事件驱动，无定时器
++
++## F2 快照推送
++- 输入：snapshot_collector 落库
++- 流程：定时触发 → SnapshotPushUsecase → ChannelRouter
++- 节奏：按 snapshot_push.schedule 整点
++- 去重：BodyHashGuard sha1
++
++## F3 日报
++- 输入：当日成交份额窗口
++- 流程：定时触发 → DailyReportUsecase → MessagePaginator → ChannelRouter
++- 节奏：每日 daily_report.schedule
++- 分页：超 4096 字符自动续发
+-- 
+2.34.1
+

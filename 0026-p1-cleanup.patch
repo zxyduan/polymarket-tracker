@@ -1,0 +1,25 @@
+From 7d248e1cc42213c33586488f16d49fc456f827c2 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 13:08:09 +0800
+Subject: [PATCH] chore(p1): drop unused run_sender import
+
+---
+ src/main.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/main.py b/src/main.py
+index 67c18f0..2872f44 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -16,7 +16,7 @@ from dotenv import load_dotenv
+ 
+ from src.bot.auth import AuthManager
+ from src.bot.commands import CommandHandler
+-from src.bot.telegram import BotRunner, TelegramApi, run_sender
++from src.bot.telegram import BotRunner, TelegramApi
+ from src.core.models import StandardEvent
+ from src.core.pipeline import PipelineRunner
+ from src.core.renderer import AlertMessage
+-- 
+2.34.1
+

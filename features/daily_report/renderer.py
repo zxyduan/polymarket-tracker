@@ -11,7 +11,7 @@ class LegacyDailyRenderer:
     def render(self, rows: list[Any], *, windows_days: list[int],
                now_bucket: int, tz_offset_hours: int,
                top_n: int) -> RenderedMessage | None:
-        from src.main import render_daily_volume_report
+        from src.snapshots.renderer import render_daily_volume_report
 
         rep = render_daily_volume_report(
             rows, windows_days=windows_days, now_bucket=now_bucket,

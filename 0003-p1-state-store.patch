@@ -1,0 +1,97 @@
+From 528e740aadeca092d493d5a4c5b23935bcacd66c Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 11:55:27 +0800
+Subject: [PATCH] feat(p1): add StateStore facade with namespaced get/set (T01)
+
+---
+ framework/store/__init__.py    |  0
+ framework/store/state_store.py | 32 ++++++++++++++++++++++++++++++++
+ tests/test_state_store.py      | 33 +++++++++++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+)
+ create mode 100644 framework/store/__init__.py
+ create mode 100644 framework/store/state_store.py
+ create mode 100644 tests/test_state_store.py
+
+diff --git a/framework/store/__init__.py b/framework/store/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/store/state_store.py b/framework/store/state_store.py
+new file mode 100644
+index 0000000..e4a9b7c
+--- /dev/null
++++ b/framework/store/state_store.py
+@@ -0,0 +1,32 @@
++"""StateStore（设计 v3.5 §3.3，T01）。
++
++对旧 sync_state 表的带命名空间门面：新代码一律按 (namespace, key) 读写，
++不再拼裸字符串；底层暂仍写旧表（旧键平铺），待 §2.2 迁移脚本把表结构
++切到 (namespace, key, value, updated_at) 后仅替换本类的存储后端，
++上层调用点不动。namespace 取值：trader / snapshot / daily_report /
++data_api / auth；未知键在迁移期隔离进 legacy。
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from src.storage import Storage
++
++
++class StateStore:
++    def __init__(self, storage: "Storage") -> None:
++        self._storage = storage
++
++    @staticmethod
++    def _compose(namespace: str, key: str) -> str:
++        # 现状平铺键：f"{namespace}:{key}"。
++        # 与 §2.2 map_state_key 的逆运算在迁移后仍保持一致（如 data_api 游标族）。
++        return f"{namespace}:{key}"
++
++    async def get(self, namespace: str, key: str) -> str | None:
++        return await self._storage.get_state(self._compose(namespace, key))
++
++    async def set(self, namespace: str, key: str, value: str) -> None:
++        await self._storage.set_state(self._compose(namespace, key), value)
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+new file mode 100644
+index 0000000..032a897
+--- /dev/null
++++ b/tests/test_state_store.py
+@@ -0,0 +1,33 @@
++"""StateStore 门面测试（T01）。"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from src.storage import Storage
++from framework.store.state_store import StateStore
++
++
++@pytest.fixture
++async def storage(tmp_path: Path) -> Storage:
++    db = Storage(str(tmp_path / "test.db"))
++    await db.init()
++    return db
++
++
++async def test_state_store_roundtrip(storage):
++    ss = StateStore(storage)
++    assert await ss.get("data_api", "l2_last_run") is None
++    await ss.set("data_api", "0xabc:last_time", "2026-11-03T00:00:00+00:00")
++    assert await ss.get("data_api", "0xabc:last_time") == "2026-11-03T00:00:00+00:00"
++    # 底层仍是旧平铺键，与旧读路径互通（迁移前行为不变）
++    assert await storage.get_state("data_api:0xabc:last_time") == "2026-11-03T00:00:00+00:00"
++
++
++async def test_state_store_overwrite(storage):
++    ss = StateStore(storage)
++    await ss.set("snapshot", "push:label", "a")
++    await ss.set("snapshot", "push:label", "b")
++    assert await ss.get("snapshot", "push:label") == "b"
+-- 
+2.34.1
+

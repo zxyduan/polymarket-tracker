@@ -1,0 +1,250 @@
+From ddfae0a5d6c9e912c2f2d0bbd5e1f3425ced5609 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:31:11 +0800
+Subject: [PATCH] =?UTF-8?q?feat(p1):=20F3=20DailyReportUsecase=20+=20ports?=
+ =?UTF-8?q?=20(=C2=A77)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ features/daily_report/__init__.py |   0
+ features/daily_report/ports.py    |  12 +++
+ features/daily_report/usecase.py  | 129 ++++++++++++++++++++++++++++++
+ tests/test_daily_usecase.py       |  65 +++++++++++++++
+ 4 files changed, 206 insertions(+)
+ create mode 100644 features/daily_report/__init__.py
+ create mode 100644 features/daily_report/ports.py
+ create mode 100644 features/daily_report/usecase.py
+ create mode 100644 tests/test_daily_usecase.py
+
+diff --git a/features/daily_report/__init__.py b/features/daily_report/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/features/daily_report/ports.py b/features/daily_report/ports.py
+new file mode 100644
+index 0000000..7a5eabb
+--- /dev/null
++++ b/features/daily_report/ports.py
+@@ -0,0 +1,12 @@
++"""F3 日报端口（§7）。"""
++
++from __future__ import annotations
++
++from typing import Any, Protocol
++
++from framework.models.message import RenderedMessage
++
++
++class DailyRenderer(Protocol):
++    def render(self, rows: list[dict], *, windows_days: list[int],
++               now_bucket: int, tz_offset_hours: int, top_n: int) -> RenderedMessage | None: ...
+diff --git a/features/daily_report/usecase.py b/features/daily_report/usecase.py
+new file mode 100644
+index 0000000..e9ea5ab
+--- /dev/null
++++ b/features/daily_report/usecase.py
+@@ -0,0 +1,129 @@
++"""F3 日报用例（§7）。
++
++步骤：cid 解析 → backfill → windows_sum 聚合 → 单调自检 →
++渲染 → paginator 分段 → body_hash 去重 → router 分发。
++行为与 trigger_daily_report 对齐；具体渲染仍复用现有 renderer。
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass, field
++from itertools import pairwise
++from typing import Any, Mapping, MutableMapping, Protocol
++
++from framework.delivery.router import ChannelRouter
++from framework.models.message import RenderedMessage
++from framework.models.ports import SnapshotQuery
++from framework.render.paginator import MessagePaginator
++from framework.scheduler.guard import BodyHashGuard
++from features.daily_report.ports import DailyRenderer
++
++logger = logging.getLogger(__name__)
++
++
++class Catalog(Protocol):
++    def markets(self) -> list[Any]: ...
++
++
++@dataclass(frozen=True)
++class DailyReportConfig:
++    windows_days: list[int] = field(default_factory=lambda: [7, 30, 90])
++    timezone_offset_hours: int = 8
++    top_n: int = 50
++    page_size: int = 30
++    dedup: bool = True
++    now_bucket: int = 0
++
++
++class DailyReportUsecase:
++    def __init__(
++        self, *,
++        catalog: Catalog,
++        query: SnapshotQuery,
++        renderer: DailyRenderer,
++        router: ChannelRouter,
++        paginator: MessagePaginator,
++        body_hash: BodyHashGuard,
++        config: DailyReportConfig,
++        health: MutableMapping[str, Any],
++    ) -> None:
++        self._catalog = catalog
++        self._query = query
++        self._renderer = renderer
++        self._router = router
++        self._paginator = paginator
++        self._hash = body_hash
++        self._cfg = config
++        self._health = health
++
++    async def run(self) -> str:
++        R = self._cfg.now_bucket
++        windows = self._cfg.windows_days
++
++        # 1) windows_sum 聚合
++        agg: dict[str, dict[int, float]] = {}
++        failed = 0
++        for d in windows:
++            try:
++                rows = await self._query.windows_sum(
++                    start_ts=R - d * 86400, end_ts=R
++                )
++            except Exception as exc:
++                failed += 1
++                logger.error("日报窗口聚合失败 d=%s: %s", d, exc)
++                continue
++            for row in rows:
++                agg.setdefault(row.condition_id.lower(), {})[d] = row.shares or 0.0
++
++        # 2) 合并行
++        out: list[dict] = []
++        for m in self._catalog.markets():
++            cid = (getattr(m, "condition_id", "") or "").lower()
++            if not cid or cid not in agg:
++                continue
++            row = {"condition_id": cid}
++            for d in windows:
++                row[f"shares_{d}d"] = max(0.0, agg[cid].get(d, 0.0))
++            out.append(row)
++
++        # 3) 单调自检（仅全部窗口成功时）
++        if failed == 0:
++            for row in out:
++                vals = [row[f"shares_{d}d"] for d in windows]
++                if any(a > b for a, b in pairwise(vals)):
++                    self._health["daily_result"] = "selfcheck_failed"
++                    return "selfcheck_failed"
++
++        # 4) 渲染
++        msg = self._renderer.render(
++            out, windows_days=windows, now_bucket=R,
++            tz_offset_hours=self._cfg.timezone_offset_hours, top_n=self._cfg.top_n,
++        )
++        if msg is None:
++            self._health["daily_result"] = "empty"
++            return "sent_dup" if failed == 0 else "degraded"
++
++        # 5) 分段
++        pages = self._paginator.paginate(msg)
++
++        # 6) dedup（按首段指纹）
++        if self._cfg.dedup:
++            if await self._hash.matches("daily", f"push:{R}", pages[0].body):
++                self._health["daily_result"] = "sent_dup"
++                return "sent_dup"
++
++        # 7) 分发
++        failures = 0
++        configured = 0
++        for p in pages:
++            res = await self._router.dispatch("daily_report", p)
++            failures += len(res.channel_failures)
++            configured = res.configured_channels
++        send_failed = failures > 0 or configured == 0
++        result = "send_failed" if send_failed else ("degraded" if failed else "sent")
++        self._health["daily_result"] = result
++
++        if self._cfg.dedup and not send_failed:
++            await self._hash.record("daily", f"push:{R}", pages[0].body)
++        return result
+diff --git a/tests/test_daily_usecase.py b/tests/test_daily_usecase.py
+new file mode 100644
+index 0000000..6e61859
+--- /dev/null
++++ b/tests/test_daily_usecase.py
+@@ -0,0 +1,65 @@
++"""DailyReportUsecase 测试。"""
++
++from __future__ import annotations
++
++import asyncio
++
++from framework.delivery.router import ChannelRouter, DeliveryResult
++from framework.models.message import RenderedMessage
++from framework.render.paginator import MessagePaginator
++from features.daily_report.usecase import DailyReportConfig, DailyReportUsecase
++
++
++class _Prov:
++    def targets(self): return []
++
++
++class _M:
++    def __init__(self, cid): self.condition_id = cid
++
++
++class Catalog:
++    def markets(self): return [_M("CID-A"), _M("CID-B")]
++
++
++class _WSum:
++    def __init__(self, cid, shares): self.condition_id = cid; self.shares = shares
++
++
++class Query:
++    async def windows_sum(self, *, start_ts, end_ts, cid=None):
++        return [_WSum("cid-a", 1.0), _WSum("cid-b", 2.0)]
++    async def latest_complete_buckets(self, now): return []
++
++
++class Renderer:
++    def render(self, rows, **kw):
++        return RenderedMessage(body="\n".join(r["condition_id"] for r in rows))
++
++
++class Hash:
++    def __init__(self): self.recorded = []
++    async def matches(self, ns, k, b): return False
++    async def record(self, ns, k, b): self.recorded.append(b)
++
++
++class Good:
++    name = "telegram"
++    def describe(self): return "t"
++    async def deliver(self, m, ts): return DeliveryResult(outcomes=())
++
++
++def _run():
++    uc = DailyReportUsecase(
++        catalog=Catalog(), query=Query(), renderer=Renderer(),
++        router=ChannelRouter([Good()], _Prov()), paginator=MessagePaginator(),
++        body_hash=Hash(), config=DailyReportConfig(now_bucket=100), health={},
++    )
++    return asyncio.run(uc.run()), uc
++
++
++def test_daily_happy():
++    result, uc = _run()
++    assert result == "sent"
++    assert uc._health["daily_result"] == "sent"
++    assert uc._hash.recorded
+-- 
+2.34.1
+

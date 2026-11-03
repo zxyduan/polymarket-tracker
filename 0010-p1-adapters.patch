@@ -1,0 +1,148 @@
+From 0abf45550eb0fe531457cdaa56897e9c9b97763e Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:23:43 +0800
+Subject: [PATCH] feat(p1): add RawRecord/RecordKind + rtds/gamma adapter
+ shells
+
+---
+ framework/models/raw.py            | 24 +++++++++++++++++++++
+ framework/sources/gamma_adapter.py | 17 +++++++++++++++
+ framework/sources/rtds_adapter.py  | 34 ++++++++++++++++++++++++++++++
+ tests/test_sources.py              | 29 +++++++++++++++++++++++++
+ 4 files changed, 104 insertions(+)
+ create mode 100644 framework/models/raw.py
+ create mode 100644 framework/sources/gamma_adapter.py
+ create mode 100644 framework/sources/rtds_adapter.py
+ create mode 100644 tests/test_sources.py
+
+diff --git a/framework/models/raw.py b/framework/models/raw.py
+new file mode 100644
+index 0000000..e3792ac
+--- /dev/null
++++ b/framework/models/raw.py
+@@ -0,0 +1,24 @@
++"""RawRecord 与 RecordKind（设计 v3.5 §9.1）。
++
++适配器产出的最原始记录；kind 供 L2 路由分发，禁止跨层透传 dict。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++from enum import Enum
++from typing import Any, Mapping
++
++
++class RecordKind(str, Enum):
++    EVENT = "event"
++    SNAPSHOT = "snapshot"
++
++
++@dataclass(frozen=True)
++class RawRecord:
++    source: str
++    kind: RecordKind
++    received_at: datetime
++    payload: Mapping[str, Any]
+diff --git a/framework/sources/gamma_adapter.py b/framework/sources/gamma_adapter.py
+new file mode 100644
+index 0000000..b3dfc9d
+--- /dev/null
++++ b/framework/sources/gamma_adapter.py
+@@ -0,0 +1,17 @@
++"""gamma 适配器（设计 v3.5 §4.2）。薄壳，缓存/降级语义不变。"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from src.sources.gamma_client import GammaClient
++
++
++class GammaAdapter:
++    def __init__(self, base_url: str, **kwargs: Any) -> None:
++        self._inner = GammaClient(base_url, **kwargs)
++
++    async def get_market(
++        self, storage: Any, condition_id: str
++    ) -> tuple[str | None, str | None]:
++        return await self._inner.get_market(storage, condition_id)
+diff --git a/framework/sources/rtds_adapter.py b/framework/sources/rtds_adapter.py
+new file mode 100644
+index 0000000..b6343b6
+--- /dev/null
++++ b/framework/sources/rtds_adapter.py
+@@ -0,0 +1,34 @@
++"""rtds 适配器（设计 v3.5 §4.2，按 10 §4.2 平移）。
++
++WebSocket 重连/心跳/退避/本地过滤语义逐字保留（红线）；
++本类为薄壳，后续 L2 路由补 RawRecord.kind=EVENT。
++"""
++
++from __future__ import annotations
++
++import asyncio
++from typing import TYPE_CHECKING, Any
++
++from src.core.models import StandardEvent
++from src.sources.rtds_client import RtdsClient
++
++if TYPE_CHECKING:
++    from src.storage import Storage
++
++
++class RtdsAdapter:
++    def __init__(self, url: str, *, volume_tracker: Any | None = None, **kwargs: Any) -> None:
++        self._inner = RtdsClient(url, volume_tracker=volume_tracker, **kwargs)
++
++    @property
++    def connected(self) -> bool:
++        return self._inner.connected
++
++    async def run(
++        self,
++        event_queue: "asyncio.Queue[StandardEvent]",
++        storage: "Storage",
++        reconcile_event: asyncio.Event,
++        stop_event: asyncio.Event,
++    ) -> None:
++        await self._inner.run(event_queue, storage, reconcile_event, stop_event)
+diff --git a/tests/test_sources.py b/tests/test_sources.py
+new file mode 100644
+index 0000000..3a036d6
+--- /dev/null
++++ b/tests/test_sources.py
+@@ -0,0 +1,29 @@
++"""sources 适配器薄壳与 RawRecord 测试。"""
++
++from __future__ import annotations
++
++from datetime import datetime, timezone
++
++from framework.models.raw import RawRecord, RecordKind
++from framework.sources.gamma_adapter import GammaAdapter
++from framework.sources.rtds_adapter import RtdsAdapter
++
++
++def test_recordkind_values():
++    assert RecordKind.EVENT.value == "event"
++    assert RecordKind.SNAPSHOT.value == "snapshot"
++
++
++def test_rawrecord_frozen():
++    r = RawRecord(
++        source="rtds",
++        kind=RecordKind.EVENT,
++        received_at=datetime(2026, 11, 3, tzinfo=timezone.utc),
++        payload={"a": 1},
++    )
++    assert r.source == "rtds"
++
++
++def test_adapters_construct():
++    assert RtdsAdapter("wss://example").connected is False
++    assert isinstance(GammaAdapter("https://example"), GammaAdapter)
+-- 
+2.34.1
+

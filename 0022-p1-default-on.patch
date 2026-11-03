@@ -1,0 +1,26 @@
+From ae57c1ad0acdf9c0f1044f0b3525176c08ec5f9b Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:55:27 +0800
+Subject: [PATCH] feat(p1): default P1_SWITCH on; old triggers remain as
+ fallback
+
+---
+ src/main.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/main.py b/src/main.py
+index ac68729..905482c 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -989,7 +989,7 @@ async def amain(config_path: str) -> None:
+             SnapshotPushConfig, SnapshotPushUsecase,
+         )
+ 
+-        p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
++        p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
+         p1_channels = [NotifierChannel(n) for n in snap_notifiers]
+ 
+         from features.market_snapshot.renderer import LegacySnapshotRenderer
+-- 
+2.34.1
+

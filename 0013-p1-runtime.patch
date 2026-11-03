@@ -1,0 +1,99 @@
+From 03476687f824b035111b7ef369f8c510d2fc8c56 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:33:57 +0800
+Subject: [PATCH] =?UTF-8?q?feat(p1):=20FeatureModule/FeatureRuntime=20regi?=
+ =?UTF-8?q?stry=20(=C2=A710,=20T11)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ framework/runtime/__init__.py |  0
+ framework/runtime/module.py   | 42 +++++++++++++++++++++++++++++++++++
+ tests/test_runtime.py         | 21 ++++++++++++++++++
+ 3 files changed, 63 insertions(+)
+ create mode 100644 framework/runtime/__init__.py
+ create mode 100644 framework/runtime/module.py
+ create mode 100644 tests/test_runtime.py
+
+diff --git a/framework/runtime/__init__.py b/framework/runtime/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/runtime/module.py b/framework/runtime/module.py
+new file mode 100644
+index 0000000..fa49d8d
+--- /dev/null
++++ b/framework/runtime/module.py
+@@ -0,0 +1,42 @@
++"""FeatureModule / FeatureRuntime（设计 v3.5 §10，T11）。
++
++每个 feature 一个独立 Module：持有自己的 router/guard/usecase，
++FEATURES 注册表集中声明；bootstrap 只构造、不写业务分支。
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass, field
++from typing import Awaitable, Callable
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class FeatureModule:
++    name: str
++    enabled: bool
++    run: Callable[[], Awaitable[None]]
++    health: dict = field(default_factory=dict)
++
++
++class FeatureRuntime:
++    def __init__(self) -> None:
++        self._modules: list[FeatureModule] = []
++
++    def register(self, module: FeatureModule) -> None:
++        self._modules.append(module)
++
++    async def run_enabled(self) -> None:
++        for m in self._modules:
++            if not m.enabled:
++                continue
++            try:
++                await m.run()
++            except Exception:
++                logger.exception("feature %s failed", m.name)
++
++    @property
++    def modules(self) -> list[FeatureModule]:
++        return list(self._modules)
+diff --git a/tests/test_runtime.py b/tests/test_runtime.py
+new file mode 100644
+index 0000000..e143c09
+--- /dev/null
++++ b/tests/test_runtime.py
+@@ -0,0 +1,21 @@
++"""FeatureRuntime 测试。"""
++
++import asyncio
++
++from framework.runtime.module import FeatureModule, FeatureRuntime
++
++
++async def ok(): ok.called += 1
++ok.called = 0
++
++
++async def boom(): raise RuntimeError("x")
++
++
++def test_runtime_runs_enabled_and_isolates_failure():
++    rt = FeatureRuntime()
++    rt.register(FeatureModule(name="a", enabled=True, run=ok))
++    rt.register(FeatureModule(name="b", enabled=False, run=ok))
++    rt.register(FeatureModule(name="c", enabled=True, run=boom))
++    asyncio.run(rt.run_enabled())
++    assert ok.called == 1  # b 跳过，c 异常不拖 a
+-- 
+2.34.1
+

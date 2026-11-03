@@ -1,0 +1,58 @@
+From eea12fb3bcc6df647c5e0033f5f550cafb334641 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 13:20:13 +0800
+Subject: [PATCH] feat(p1): sync_state key namespace migration script
+
+---
+ scripts/migrate_sync_state.py | 39 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+ create mode 100644 scripts/migrate_sync_state.py
+
+diff --git a/scripts/migrate_sync_state.py b/scripts/migrate_sync_state.py
+new file mode 100644
+index 0000000..0eae6b0
+--- /dev/null
++++ b/scripts/migrate_sync_state.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""P1 收尾：sync_state 键 namespace 迁移。
++
++旧键前缀        新 namespace
++snap_push:      snapshot:
++daily_report:   daily_report:   （不变）
++data_api:       data_api:       （不变）
++
++幂等：重复跑不重复迁移。
++"""
++
++import sqlite3
++import sys
++
++MIGRATIONS = {
++    "snap_push:": "snapshot:",
++}
++
++
++def main(db: str) -> None:
++    con = sqlite3.connect(db)
++    cur = con.cursor()
++    rows = cur.execute("SELECT key, value, updated_at FROM sync_state").fetchall()
++    moved = 0
++    for old, value, updated in rows:
++        for old_prefix, new_prefix in MIGRATIONS.items():
++            if old.startswith(old_prefix):
++                new = new_prefix + old[len(old_prefix):]
++                cur.execute(
++                    "UPDATE sync_state SET key=? WHERE key=?", (new, old)
++                )
++                moved += 1
++                print(f"  {old} -> {new}")
++    con.commit()
++    print(f"done: {moved} rows migrated")
++
++
++if __name__ == "__main__":
++    main(sys.argv[1] if len(sys.argv) > 1 else "data/monitor.db")
+-- 
+2.34.1
+

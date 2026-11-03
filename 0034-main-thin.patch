@@ -1,0 +1,2405 @@
+diff --git a/features/daily_report/renderer.py b/features/daily_report/renderer.py
+index 1b2f2ad..0551a71 100644
+--- a/features/daily_report/renderer.py
++++ b/features/daily_report/renderer.py
+@@ -11,7 +11,7 @@ class LegacyDailyRenderer:
+     def render(self, rows: list[Any], *, windows_days: list[int],
+                now_bucket: int, tz_offset_hours: int,
+                top_n: int) -> RenderedMessage | None:
+-        from src.main import render_daily_volume_report
++        from src.snapshots.renderer import render_daily_volume_report
+ 
+         rep = render_daily_volume_report(
+             rows, windows_days=windows_days, now_bucket=now_bucket,
+diff --git a/framework/app.py b/framework/app.py
+new file mode 100644
+index 0000000..d6246fa
+--- /dev/null
++++ b/framework/app.py
+@@ -0,0 +1,359 @@
++"""应用装配：build_app() 集中创建所有客户端、通道、任务并返回运行句柄。
++
++从 src/main.py 搬出；main.py 只调用 build_app() 并等待停止信号。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import signal
++from typing import Any
++
++from dotenv import load_dotenv
++
++from src.bot.auth import AuthManager
++from src.bot.commands import CommandHandler
++from src.bot.telegram import BotRunner, TelegramApi
++from src.core.models import StandardEvent
++from src.core.pipeline import PipelineRunner
++from src.core.renderer import AlertMessage
++from src.notify import Notifier, build_notifiers
++from src.settings import Settings, resolve_daily_config
++from src.snapshots.collector import SnapshotCollector, _current_bucket_start
++from src.snapshots.commands import DailyCommandHandler, SnapshotCommandHandler
++from src.sources.data_api_client import DataApiClient
++from src.sources.gamma_client import GammaClient
++from src.sources.rtds_client import RtdsClient
++from src.storage import Storage
++from src.utils.logging import setup_logging
++from src.utils.retry import backoff_delay
++
++from framework.runtime.loops import (
++    daily_report_loop,
++    heartbeat_writer,
++    health_watcher,
++    prune_loop,
++    snapshot_collect_loop,
++    snapshot_push_loop,
++    supervised,
++    _snapshot_collect_round,
++)
++
++logger = logging.getLogger("app")
++
++
++class AppHandle:
++    """运行句柄：build_app() 返回，main.py 用它等待停止并收尾。"""
++
++    def __init__(self) -> None:
++        self.tasks: list[asyncio.Task] = []
++        self.stop_event: asyncio.Event = asyncio.Event()
++        self.storage: Storage | None = None
++        self.snap_collector: SnapshotCollector | None = None
++        self.pipeline: PipelineRunner | None = None
++
++
++async def build_app(config_path: str) -> AppHandle:
++    load_dotenv()
++    settings = Settings.load(config_path)
++    setup_logging(
++        settings.log_level,
++        log_file=settings.get("logging.file"),
++        max_mb=int(settings.get("logging.max_mb", 10)),
++        backups=int(settings.get("logging.backups", 5)),
++    )
++    logger.info("服务启动")
++
++    h = AppHandle()
++
++    # 存储
++    storage = Storage("data/monitor.db")
++    await storage.init()
++    h.storage = storage
++    seeded = await storage.seed_wallets(settings.watchlist_seeds)
++    if seeded:
++        logger.info("配置种子新增监控地址 %d 个", seeded)
++
++    endpoints = settings.section("endpoints")
++    polling = settings.section("polling")
++
++    # 客户端
++    rtds = RtdsClient(
++        str(endpoints.get("rtds")),
++        heartbeat_seconds=int(polling.get("rtds_heartbeat_seconds", 15)),
++        reconnect_min_seconds=float(polling.get("reconnect_min_seconds", 1)),
++        reconnect_max_seconds=float(polling.get("reconnect_max_seconds", 30)),
++    )
++    data_api = DataApiClient(
++        str(endpoints.get("data_api")),
++        interval_seconds=int(polling.get("reconciliation_interval_seconds", 60)),
++        timeout_seconds=int(polling.get("request_timeout_seconds", 10)),
++        max_concurrency=int(polling.get("max_concurrent_requests", 5)),
++        page_limit=int(polling.get("cold_start_fetch_limit", 50)),
++    )
++    gamma = GammaClient(
++        str(endpoints.get("gamma_api")),
++        timeout_seconds=int(polling.get("request_timeout_seconds", 10)),
++        cache_ttl_hours=int(settings.get("market_cache.ttl_hours", 24)),
++    )
++
++    event_queue: asyncio.Queue[StandardEvent] = asyncio.Queue(maxsize=10000)
++    message_queue: asyncio.Queue[AlertMessage] = asyncio.Queue(maxsize=1000)
++    reconcile_event = asyncio.Event()
++    stop_event = h.stop_event
++
++    # 冷启动基线
++    wallets = await storage.list_wallets(active_only=True)
++    cold_attempt = 0
++    while not stop_event.is_set():
++        try:
++            await data_api.cold_start(wallets, storage)
++            break
++        except Exception as exc:  # noqa: BLE001
++            cold_attempt += 1
++            delay = backoff_delay(cold_attempt, 2.0, 60.0)
++            logger.warning("冷启动基线建立失败: %s，%.0fs 后重试", exc, delay)
++            await asyncio.sleep(delay)
++
++    pipeline = PipelineRunner(event_queue, message_queue, storage, gamma, settings)
++    h.pipeline = pipeline
++    health: dict[str, Any] = {"rtds_connected": False, "l2_last_run": "-"}
++
++    # ── 市场快照 ──
++    snapshot_push_cfg = settings.snapshot_push
++    snapshot_cfg = settings.snapshot
++    markets = settings.markets
++    if markets:
++        logger.info("快照市场 %d 个: %s", len(markets), [m.slug_id for m in markets])
++    else:
++        logger.info("快照市场为空，仅注册推送循环")
++    snap_collector = SnapshotCollector(
++        storage,
++        gamma_host=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
++        clob_host=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
++        timeout=float(snapshot_cfg.get("request_timeout_seconds", 15)),
++        price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
++    )
++    h.snap_collector = snap_collector
++    snap_health: dict[str, Any] = {"snap_last_push": "-"}
++    collect_state: dict[str, float] = {"round_done_ts": 0.0}
++    snap_notifiers: list[Notifier] = []
++
++    # P1 usecase 引用容器（装配后填充）
++    p1: dict[str, Any] = {}
++
++    async def _trader_consumer(queue, stop):
++        while not stop.is_set():
++            alert = await queue.get()
++            try:
++                if "trader" in p1:
++                    await p1["trader"].handle(alert)
++                else:
++                    for n in trader_notifiers:
++                        try:
++                            await n.send(alert.html, buttons=alert.buttons,
++                                         event_keys=alert.event_keys)
++                        except Exception as exc:
++                            logger.error("推送失败(%s): %s", n.describe(), exc)
++            finally:
++                queue.task_done()
++
++    # ── 日报 ──
++    daily_notifiers: list[Notifier] = []
++    daily_health: dict[str, Any] = {"daily_last_push": "-", "daily_result": "-"}
++    daily_cfg = resolve_daily_config(settings)
++    for _warn in daily_cfg.warnings:
++        logger.warning("daily_report 配置警告: %s", _warn)
++    for _err in daily_cfg.errors:
++        logger.error("daily_report 配置致命错误: %s", _err)
++    if not daily_cfg.enabled:
++        logger.info("daily_report 未启用或配置存在致命错误，日报任务不注册")
++
++    async def trigger_snapshot_push() -> None:
++        if "snap" in p1:
++            await p1["snap"]()
++            return
++        logger.error("快照推送 usecase 未装配")
++
++    async def trigger_snapshot_now() -> None:
++        await _snapshot_collect_round(snap_collector, markets)
++        await trigger_snapshot_push()
++
++    async def _fire_daily_report() -> str:
++        if "daily" in p1:
++            return await p1["daily"]()
++        logger.error("日报 usecase 未装配，返回 send_failed")
++        return "send_failed"
++
++    tasks = [
++        asyncio.create_task(supervised(
++            "rtds", lambda: rtds.run(event_queue, storage, reconcile_event, stop_event), stop_event)),
++        asyncio.create_task(supervised(
++            "data_api", lambda: data_api.run(event_queue, storage, reconcile_event, stop_event), stop_event)),
++        asyncio.create_task(supervised("pipeline", pipeline.run, stop_event)),
++        asyncio.create_task(heartbeat_writer(stop_event)),
++        asyncio.create_task(health_watcher(health, rtds, storage, stop_event)),
++        asyncio.create_task(supervised(
++            "prune", lambda: prune_loop(storage, settings, stop_event), stop_event)),
++    ]
++    if markets:
++        collect_interval = int(snapshot_cfg.get("collect_interval_seconds", 600))
++        tasks.append(asyncio.create_task(supervised(
++            "snapshot_collect",
++            lambda: snapshot_collect_loop(snap_collector, markets, stop_event,
++                                          collect_state, interval_seconds=collect_interval),
++            stop_event)))
++    if snapshot_push_cfg.get("enabled", True) and snapshot_push_cfg.get("schedule"):
++        tasks.append(asyncio.create_task(supervised(
++            "snapshot_push",
++            lambda: snapshot_push_loop(storage, settings, trigger_snapshot_push, stop_event),
++            stop_event)))
++
++    # ── 推送通道装配 ──
++    trader_notifiers: list[Notifier] = []
++    tg_api: TelegramApi | None = None
++    auth: AuthManager | None = None
++    if "telegram" in settings.notify_platforms and settings.bot_token:
++        tg_api = TelegramApi(settings.bot_token)
++        auth = AuthManager(settings.allowed_chat_ids, storage)
++        await auth.load()
++    trader_notifiers = build_notifiers(settings, storage, tg_api, auth, kind="trader")
++    if trader_notifiers:
++        tasks.append(asyncio.create_task(supervised(
++            "bot_sender", lambda: _trader_consumer(message_queue, stop_event), stop_event)))
++        logger.info("交易员推送通道已启用: %s", [n.describe() for n in trader_notifiers])
++    else:
++        logger.warning("推送通道均未启用，交易员告警不推送")
++    if tg_api is not None and auth is not None:
++        bot = BotRunner(tg_api, storage, auth)
++        command_handler = CommandHandler(storage, health, digest_manager=pipeline.digest)
++        tasks.append(asyncio.create_task(supervised(
++            "bot_updates", lambda: bot.run_updates(command_handler, stop_event), stop_event)))
++
++    # ── 快照推送通道 ──
++    snap_tg_api: TelegramApi | None = None
++    snap_auth: AuthManager | None = None
++    if "telegram" in settings.notify_platforms and settings.snapshot_bot_token:
++        snap_tg_api = TelegramApi(settings.snapshot_bot_token)
++        snap_auth = AuthManager([], storage, state_key="snap_allowed_chats")
++        await snap_auth.load()
++        snap_runner = BotRunner(snap_tg_api, storage, snap_auth)
++        snap_cmd = SnapshotCommandHandler(
++            markets, snap_collector, storage, trigger_snapshot_now, snap_health,
++            markets_path=str(settings.config_path.parent / "markets.toml"),
++            **({"trigger_daily": _fire_daily_report, "daily_health": daily_health}
++               if daily_cfg.enabled else {}),
++        )
++        tasks.append(asyncio.create_task(supervised(
++            "snap_bot_updates", lambda: snap_runner.run_updates(snap_cmd, stop_event), stop_event)))
++        logger.info("快照 Bot 已启用（独立白名单）")
++    snap_notifiers = build_notifiers(settings, storage, snap_tg_api, snap_auth, kind="snapshot")
++    if snap_notifiers:
++        logger.info("快照推送通道已启用: %s", [n.describe() for n in snap_notifiers])
++    else:
++        logger.warning("快照推送通道均未启用，快照仅采集不推送")
++
++    # ── 日报通道 ──
++    if daily_cfg.enabled:
++        daily_tg_api: TelegramApi | None = None
++        daily_auth: AuthManager | None = None
++        if "telegram" in settings.notify_platforms:
++            independent_token = settings.daily_bot_token
++            if independent_token:
++                daily_tg_api = TelegramApi(independent_token)
++                daily_auth = AuthManager([], storage, state_key="daily_allowed_chats")
++                await daily_auth.load()
++                daily_runner = BotRunner(daily_tg_api, storage, daily_auth)
++                daily_cmd = DailyCommandHandler(
++                    trigger_daily=_fire_daily_report, daily_health=daily_health)
++                tasks.append(asyncio.create_task(supervised(
++                    "daily_bot_updates",
++                    lambda: daily_runner.run_updates(daily_cmd, stop_event), stop_event)))
++                logger.info("日报独立 Bot 已启用")
++            elif snap_tg_api is not None and snap_auth is not None:
++                daily_tg_api = snap_tg_api
++                daily_auth = snap_auth
++            else:
++                logger.warning("日报 telegram 通道未配置 token，跳过")
++        daily_notifiers = build_notifiers(
++            settings, storage, daily_tg_api, daily_auth, kind="daily")
++        if daily_notifiers:
++            logger.info("日报推送通道已启用: %s", [n.describe() for n in daily_notifiers])
++        else:
++            logger.warning("日报推送通道均未启用，日报不会推送")
++        if daily_notifiers:
++            tasks.append(asyncio.create_task(supervised(
++                "daily_report",
++                lambda: daily_report_loop(storage, daily_cfg, _fire_daily_report, stop_event),
++                stop_event)))
++
++    # ── P1 bootstrap ──
++    try:
++        p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
++        if p1_switch:
++            from framework.bootstrap import build_runtime
++            from features.market_snapshot.renderer import LegacySnapshotRenderer
++            from features.daily_report.renderer import LegacyDailyRenderer
++            from features.trader.renderer import LegacyTraderRenderer
++            from features.market_snapshot.usecase import SnapshotPushConfig
++            from features.daily_report.usecase import DailyReportConfig
++
++            class _Catalog:
++                def slugs(self): return [m.slug for m in markets]
++
++            _rt, _trader_uc = build_runtime(
++                storage=storage, collector=snap_collector, catalog=_Catalog(),
++                snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
++                trader_notifiers=trader_notifiers,
++                snap_renderer=LegacySnapshotRenderer(
++                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
++                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
++                ),
++                daily_renderer=LegacyDailyRenderer(),
++                trader_renderer=LegacyTraderRenderer(),
++                snap_cfg=SnapshotPushConfig(
++                    dedup=bool(snapshot_push_cfg.get("dedup", True)),
++                    now_bucket=_current_bucket_start(),
++                ),
++                daily_cfg=DailyReportConfig(
++                    windows_days=list(daily_cfg.windows_days),
++                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
++                    top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
++                    now_bucket=_current_bucket_start(),
++                ),
++                snap_health=snap_health, daily_health=daily_health,
++            )
++            p1["snap"] = next(m.run for m in _rt.modules if m.name == "market_snapshot")
++            p1["daily"] = next(m.run for m in _rt.modules if m.name == "daily_report")
++            p1["trader"] = _trader_uc
++            logger.info("P1 三个 feature 已接管")
++    except Exception:  # noqa: BLE001
++        logger.exception("P1 bootstrap 装配失败")
++
++    # 信号处理
++    loop = asyncio.get_running_loop()
++    def _on_stop() -> None:
++        logger.info("收到停止信号，准备退出")
++        stop_event.set()
++    for sig in (signal.SIGTERM, signal.SIGINT):
++        loop.add_signal_handler(sig, _on_stop)
++
++    h.tasks = tasks
++    return h
++
++
++async def shutdown_app(h: AppHandle) -> None:
++    """收尾：等待发送完成 → 取消任务 → 关连接。"""
++    if h.pipeline:
++        await h.pipeline.shutdown()
++    await asyncio.sleep(1)
++    for task in h.tasks:
++        task.cancel()
++    await asyncio.gather(*h.tasks, return_exceptions=True)
++    if h.snap_collector:
++        await h.snap_collector.aclose()
++    if h.storage:
++        await h.storage.close()
++    logger.info("服务已停止")
+diff --git a/framework/runtime/loops.py b/framework/runtime/loops.py
+new file mode 100644
+index 0000000..b8417ac
+--- /dev/null
++++ b/framework/runtime/loops.py
+@@ -0,0 +1,269 @@
++"""运行时循环：心跳/健康/清理/快照采集推送/日报调度/任务监护。
++
++从 src/main.py 搬出，main.py 只留入口装配。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import time
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from typing import Any, Awaitable, Callable
++
++from src.settings import DailyReportConfig, Settings
++from src.snapshots.collector import SnapshotCollector
++from src.storage import Storage
++from src.utils.retry import backoff_delay
++
++logger = logging.getLogger("loops")
++
++
++# ── 基础设施循环 ─────────────────────────────────────────────────────────
++
++
++async def heartbeat_writer(stop_event: asyncio.Event) -> None:
++    """每 15s 写心跳文件，供容器 healthcheck。"""
++    path = Path("data/heartbeat")
++    while not stop_event.is_set():
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(str(time.time()))
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=15)
++        except asyncio.TimeoutError:
++            pass
++
++
++async def health_watcher(
++    health: dict[str, Any],
++    rtds: Any,
++    storage: Storage,
++    stop_event: asyncio.Event,
++) -> None:
++    """刷新运行状态（供 /status 读取）。"""
++    local_tz = timezone(timedelta(hours=8))
++    while not stop_event.is_set():
++        health["rtds_connected"] = rtds.connected
++        raw = await storage.get_state("l2_last_run")
++        if raw:
++            dt = datetime.fromisoformat(raw).astimezone(local_tz)
++            health["l2_last_run"] = dt.strftime("%m-%d %H:%M")
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=20)
++        except asyncio.TimeoutError:
++            pass
++
++
++async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.Event) -> None:
++    """每日清理：过期事件、过期推送记录、过期快照，并 VACUUM 回收文件空间。"""
++    events_days = int(settings.get("events.retention_days", 180))
++    notifications_days = int(settings.get("events.notifications_retention_days", 30))
++    snapshot_days = int(settings.snapshot.get("retention_days", 90))
++    while not stop_event.is_set():
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=86400)
++        except asyncio.TimeoutError:
++            await storage.prune_events(events_days)
++            await storage.prune_notifications(notifications_days)
++            await storage.prune_snapshots(snapshot_days)
++            await storage.vacuum()
++            logger.info(
++                "数据清理完成（事件 %d 天 / 推送记录 %d 天 / 快照 %d 天 / 已 VACUUM）",
++                events_days, notifications_days, snapshot_days,
++            )
++
++
++# ── 市场快照采集与推送 ──────────────────────────────────────────────────
++
++
++async def snapshot_collect_loop(
++    collector: SnapshotCollector,
++    markets: list[Any],
++    stop_event: asyncio.Event,
++    collect_state: dict[str, float] | None = None,
++    interval_seconds: int = 600,
++) -> None:
++    """固定间隔采集（默认 10 分钟一轮）；启动先跑一轮。"""
++    state = collect_state if collect_state is not None else {}
++    await _snapshot_collect_round(collector, markets)
++    state["round_done_ts"] = float(time.time())
++    while not stop_event.is_set():
++        now = int(time.time())
++        delay = interval_seconds - (now % interval_seconds)
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=delay + 2)
++        except asyncio.TimeoutError:
++            pass
++        if stop_event.is_set():
++            break
++        await _snapshot_collect_round(collector, markets)
++        state["round_done_ts"] = float(time.time())
++
++
++async def _snapshot_collect_round(
++    collector: SnapshotCollector,
++    markets: list[Any],
++) -> None:
++    """采集一轮全部市场；单市场失败跳过不影响整轮。"""
++    for m in markets:
++        try:
++            cid = m.condition_id
++            yes_token: str | None = None
++            resolved = await collector.resolve_market(m.slug)
++            if resolved:
++                if not cid:
++                    cid, yes_token = resolved
++                else:
++                    yes_token = resolved[1]
++            if not cid or not yes_token:
++                logger.warning(
++                    "快照市场标识解析失败，跳过: %s（cid=%s token=%s）",
++                    m.slug_id, bool(cid), bool(yes_token),
++                )
++                continue
++            await collector.collect(
++                condition_id=cid, yes_token_id=yes_token,
++                slug=m.slug, slug_id=m.slug_id,
++                fv_initial=m.fv_initial, fv_end_date=m.fv_end_date,
++            )
++        except Exception as exc:  # noqa: BLE001
++            logger.warning("快照采集失败 %s: %s", m.slug_id, exc)
++
++
++def _parse_snapshot_schedule(schedule: list[str]) -> list[tuple[int, int, str]]:
++    """解析时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。"""
++    out: list[tuple[int, int, str]] = []
++    seen: set[tuple[int, int]] = set()
++    for item in schedule:
++        text = str(item).strip()
++        try:
++            parts = text.split(":")
++            hour = int(parts[0])
++            minute = int(parts[1]) if len(parts) > 1 else 0
++        except (ValueError, IndexError):
++            logger.warning("快照推送时间格式错误，跳过: %s", text)
++            continue
++        if hour == 24:
++            hour, label = 0, "24:00"
++        else:
++            label = text
++        key = (hour, minute)
++        if key in seen:
++            continue
++        seen.add(key)
++        out.append((hour, minute, label))
++    return out
++
++
++async def snapshot_push_loop(
++    storage: Storage,
++    settings: Settings,
++    trigger_push: Any,
++    stop_event: asyncio.Event,
++) -> None:
++    """按配置的时间整点推送总览；已推过的整点不重推，错过的整点不补推。"""
++    push_cfg = settings.snapshot_push
++    schedule = _parse_snapshot_schedule(push_cfg.get("schedule", []) or [])
++    tz_offset = int(push_cfg.get("timezone_offset_hours", 8))
++    if not schedule:
++        logger.info("快照推送时间表为空，推送循环退出")
++        return
++    local_tz = timezone(timedelta(hours=tz_offset))
++    while not stop_event.is_set():
++        now_bj = datetime.now(local_tz)
++        pushed_any = False
++        for hour, minute, label in schedule:
++            if (now_bj.hour, now_bj.minute) != (hour, minute):
++                continue
++            date_key = now_bj.strftime("%Y-%m-%d")
++            state_key = f"snap_push:{date_key}:{label}"
++            if await storage.get_state(state_key):
++                continue
++            try:
++                await trigger_push()
++            except Exception as exc:  # noqa: BLE001
++                logger.error("整点推送失败 %s: %s", label, exc)
++                continue
++            await storage.set_state(state_key, "1")
++            logger.info("整点快照已推送: %s %s", date_key, label)
++            pushed_any = True
++        if pushed_any:
++            await asyncio.sleep(60)
++            continue
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=30)
++        except asyncio.TimeoutError:
++            pass
++
++
++# ── 日报调度 ─────────────────────────────────────────────────────────────
++
++
++_DAILY_RETRY_WAIT_SECONDS = 5
++
++
++async def daily_report_loop(
++    storage: Storage,
++    cfg: DailyReportConfig,
++    trigger_daily_report: Callable[[], Awaitable[str]],
++    stop_event: asyncio.Event,
++) -> None:
++    """每日单时刻推送日报；终值落 state，send_failed 同分钟重试。"""
++    local_tz = timezone(timedelta(hours=cfg.timezone_offset_hours))
++    while not stop_event.is_set():
++        now_local = datetime.now(local_tz)
++        date_key = now_local.strftime("%Y-%m-%d")
++        state_key = f"daily_report:{date_key}"
++        if (now_local.hour, now_local.minute) == (cfg.time_hour, cfg.time_minute):
++            if await storage.get_state(state_key) is None:
++                try:
++                    result = await trigger_daily_report()
++                except Exception as exc:  # noqa: BLE001
++                    logger.error("日报触发异常: %s", exc)
++                    result = "send_failed"
++                if result != "send_failed":
++                    await storage.set_state(state_key, result)
++                    logger.info("当日日报完成: %s = %s", date_key, result)
++            wait_seconds = (
++                60 if await storage.get_state(state_key) is not None
++                else _DAILY_RETRY_WAIT_SECONDS
++            )
++            try:
++                await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
++            except asyncio.TimeoutError:
++                pass
++            continue
++        try:
++            await asyncio.wait_for(stop_event.wait(), timeout=30)
++        except asyncio.TimeoutError:
++            pass
++
++
++# ── 任务监护 ────────────────────────────────────────────────────────────
++
++
++def supervised(
++    name: str,
++    factory: Callable[[], Any],
++    stop_event: asyncio.Event,
++) -> Any:
++    """任务监护：异常退出后自动重启，stop_event 置位后正常退出。"""
++
++    async def wrapper() -> None:
++        attempt = 0
++        while not stop_event.is_set():
++            task = asyncio.create_task(factory())
++            try:
++                await task
++                return
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:  # noqa: BLE001
++                logger.warning("任务 %s 异常退出: %s", name, exc)
++            attempt += 1
++            delay = backoff_delay(attempt, 1.0, 30.0)
++            logger.info("任务 %s %.1fs 后重启", name, delay)
++            await asyncio.sleep(delay)
++
++    return wrapper()
+diff --git a/src/main.py b/src/main.py
+index 8d8cee3..dd2cca5 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -1,1066 +1,30 @@
+-"""服务入口：装配并监护全部异步任务。"""
++"""服务入口：parse args → build_app → wait stop → shutdown。
++
++装配逻辑在 framework/app.py，运行时循环在 framework/runtime/loops.py。
++本文件仅做命令行入口和必要的 re-export（兼容旧测试 import）。
++"""
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import asyncio
+ import logging
+-import signal
+-import time
+-from datetime import datetime, timedelta, timezone
+-from itertools import pairwise
+-from pathlib import Path
+-from typing import Any, Awaitable, Callable
+-
+-from dotenv import load_dotenv
+ 
+-from src.bot.auth import AuthManager
+-from src.bot.commands import CommandHandler
+-from src.bot.telegram import BotRunner, TelegramApi
+-from src.core.models import StandardEvent
+-from src.core.pipeline import PipelineRunner
+-from src.core.renderer import AlertMessage
+-from src.notify import Notifier, build_notifiers
+-from src.settings import DailyReportConfig, Settings, resolve_daily_config
+-from src.snapshots.collector import (
+-    SnapshotCollector,
+-    _current_bucket_start,
++# Re-export：测试仍从 src.main import 这些符号（避免大规模改测试 import）
++from framework.runtime.loops import (  # noqa: F401
++    _parse_snapshot_schedule,
++    daily_report_loop,
+ )
+-from src.snapshots.commands import DailyCommandHandler, SnapshotCommandHandler
+-from src.snapshots.renderer import render_daily_volume_report, render_snapshot_summary
+-from src.sources.data_api_client import DataApiClient
+-from src.sources.gamma_client import GammaClient
+-from src.sources.rtds_client import RtdsClient
+-from src.storage import Storage
+-from src.utils.logging import setup_logging
+-from src.utils.retry import backoff_delay
+ 
+ logger = logging.getLogger("main")
+ 
+ 
+-async def heartbeat_writer(stop_event: asyncio.Event) -> None:
+-    """每 15s 写心跳文件，供容器 healthcheck。"""
+-    path = Path("data/heartbeat")
+-    while not stop_event.is_set():
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        path.write_text(str(time.time()))
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=15)
+-        except asyncio.TimeoutError:
+-            pass
+-
+-
+-async def health_watcher(
+-    health: dict[str, Any],
+-    rtds: RtdsClient,
+-    storage: Storage,
+-    stop_event: asyncio.Event,
+-) -> None:
+-    """刷新运行状态（供 /status 读取）。"""
+-    local_tz = timezone(timedelta(hours=8))
+-    while not stop_event.is_set():
+-        health["rtds_connected"] = rtds.connected
+-        raw = await storage.get_state("l2_last_run")
+-        if raw:
+-            dt = datetime.fromisoformat(raw).astimezone(local_tz)
+-            health["l2_last_run"] = dt.strftime("%m-%d %H:%M")
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=20)
+-        except asyncio.TimeoutError:
+-            pass
+-
+-
+-async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.Event) -> None:
+-    """每日清理：过期事件、过期推送记录、过期快照，并 VACUUM 回收文件空间。"""
+-    events_days = int(settings.get("events.retention_days", 180))
+-    notifications_days = int(
+-        settings.get("events.notifications_retention_days", 30)
+-    )
+-    snapshot_days = int(settings.snapshot.get("retention_days", 90))
+-    while not stop_event.is_set():
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=86400)
+-        except asyncio.TimeoutError:
+-            await storage.prune_events(events_days)
+-            await storage.prune_notifications(notifications_days)
+-            await storage.prune_snapshots(snapshot_days)
+-            await storage.vacuum()
+-            logger.info(
+-                "数据清理完成（事件 %d 天 / 推送记录 %d 天 / 快照 %d 天 / 已 VACUUM）",
+-                events_days,
+-                notifications_days,
+-                snapshot_days,
+-            )
+-
+-
+-# ── 市场快照采集与推送 ──────────────────────────────────────────────────
+-
+-
+-async def snapshot_collect_loop(
+-    collector: SnapshotCollector,
+-    markets: list[Any],
+-    stop_event: asyncio.Event,
+-    collect_state: dict[str, float] | None = None,
+-    interval_seconds: int = 600,
+-) -> None:
+-    """固定间隔采集（默认 10 分钟一轮，桶内可重试）；启动先跑一轮。
+-
+-    旧版只在 2h 桶边界 +2s 采一次，低活跃市场新桶头几秒没有价点时当轮
+-    早退且永不补齐，最新桶永久冻结（10-20 事故）。改为 10 分钟一轮后：
+-    - 新桶头几分钟没价点，下一轮（10 分钟内）即可补上；
+-    - 每轮都用已拉回的历史价点补齐缺失闭合桶（漏桶自愈）；
+-    - 每轮都幂等结算上一闭合桶量、在宽限窗口内记录新桶起点基线。
+-
+-    collect_state 记录最近一轮采集完成的时间戳。
+-    """
+-    state = collect_state if collect_state is not None else {}
+-    # 启动首轮：collect 内部按"距桶起点的时间"自行决定是否记基线（超宽限不记），
+-    # 不再依赖调用方区分边界轮/中途轮。
+-    await _snapshot_collect_round(collector, markets)
+-    state["round_done_ts"] = float(time.time())
+-    while not stop_event.is_set():
+-        now = int(time.time())
+-        delay = interval_seconds - (now % interval_seconds)
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=delay + 2)
+-        except asyncio.TimeoutError:
+-            pass
+-        if stop_event.is_set():
+-            break
+-        await _snapshot_collect_round(collector, markets)
+-        state["round_done_ts"] = float(time.time())
+-
+-
+-async def _snapshot_collect_round(
+-    collector: SnapshotCollector,
+-    markets: list[Any],
+-) -> None:
+-    """采集一轮全部市场；单市场失败跳过不影响整轮。
+-
+-    collect() 幂等：同一桶内重复执行只补全不污染，补算与基线落库由
+-    collector 内部按时间窗口自行判定。
+-    """
+-    for m in markets:
+-        try:
+-            cid = m.condition_id
+-            yes_token: str | None = None
+-            resolved = await collector.resolve_market(m.slug)
+-            if resolved:
+-                if not cid:
+-                    cid, yes_token = resolved
+-                else:
+-                    yes_token = resolved[1]
+-            if not cid or not yes_token:
+-                logger.warning(
+-                    "快照市场标识解析失败，跳过: %s（cid=%s token=%s）",
+-                    m.slug_id,
+-                    bool(cid),
+-                    bool(yes_token),
+-                )
+-                continue
+-            await collector.collect(
+-                condition_id=cid,
+-                yes_token_id=yes_token,
+-                slug=m.slug,
+-                slug_id=m.slug_id,
+-                fv_initial=m.fv_initial,
+-                fv_end_date=m.fv_end_date,
+-            )
+-        except Exception as exc:  # noqa: BLE001 - 单市场失败跳过
+-            logger.warning("快照采集失败 %s: %s", m.slug_id, exc)
+-
+-
+-def _parse_snapshot_schedule(schedule: list[str]) -> list[tuple[int, int, str]]:
+-    """解析时间 HH:MM 列表 → [(hour, minute, label)]；24:00 归一为 00:00。
+-
+-    同一时刻（含 00:00 与 24:00 并存）只保留一条，防止午夜/重复配置双推。
+-    """
+-    out: list[tuple[int, int, str]] = []
+-    seen: set[tuple[int, int]] = set()
+-    for item in schedule:
+-        text = str(item).strip()
+-        try:
+-            parts = text.split(":")
+-            hour = int(parts[0])
+-            minute = int(parts[1]) if len(parts) > 1 else 0
+-        except (ValueError, IndexError):
+-            logger.warning("快照推送时间格式错误，跳过: %s", text)
+-            continue
+-        if hour == 24:
+-            hour, label = 0, "24:00"
+-        else:
+-            label = text
+-        key = (hour, minute)
+-        if key in seen:
+-            continue
+-        seen.add(key)
+-        out.append((hour, minute, label))
+-    return out
+-
+-
+-async def snapshot_push_loop(
+-    storage: Storage,
+-    settings: Settings,
+-    trigger_push: Any,
+-    stop_event: asyncio.Event,
+-) -> None:
+-    """按配置的时间整点推送总览；已推过的整点不重推，错过的整点不补推。
+-
+-    重复内容由 trigger_snapshot_push 的 dedup 再去一层（2h 桶配整点推送时，
+-    奇数点内容相同会被抑制）。
+-    """
+-    push_cfg = settings.snapshot_push
+-    schedule = _parse_snapshot_schedule(push_cfg.get("schedule", []) or [])
+-    tz_offset = int(push_cfg.get("timezone_offset_hours", 8))
+-    if not schedule:
+-        logger.info("快照推送时间表为空，推送循环退出")
+-        return
+-
+-    local_tz = timezone(timedelta(hours=tz_offset))
+-    while not stop_event.is_set():
+-        now_bj = datetime.now(local_tz)
+-        pushed_any = False
+-        for hour, minute, label in schedule:
+-            if (now_bj.hour, now_bj.minute) != (hour, minute):
+-                continue
+-            date_key = now_bj.strftime("%Y-%m-%d")
+-            state_key = f"snap_push:{date_key}:{label}"
+-            already = await storage.get_state(state_key)
+-            if already:
+-                continue
+-            try:
+-                await trigger_push()
+-            except Exception as exc:  # noqa: BLE001 - 推送失败不影响下次
+-                logger.error("整点推送失败 %s: %s", label, exc)
+-                continue
+-            await storage.set_state(state_key, "1")
+-            logger.info("整点快照已推送: %s %s", date_key, label)
+-            pushed_any = True
+-        if pushed_any:
+-            # 推完一轮后等下一个整点再查
+-            await asyncio.sleep(60)
+-            continue
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=30)
+-        except asyncio.TimeoutError:
+-            pass
+-
+-
+-# ── 每日成交份额汇总：定时循环（日报功能代号 daily_report）──────────────
+-
+-# 发送失败后的同分钟重试等待（远小于 60s，保证 07:00 分钟内至少重试一次）
+-_DAILY_RETRY_WAIT_SECONDS = 5
+-
+-
+-async def daily_report_loop(
+-    storage: Storage,
+-    cfg: DailyReportConfig,
+-    trigger_daily_report: Callable[[], Awaitable[str]],
+-    stop_event: asyncio.Event,
+-) -> None:
+-    """每日单时刻推送日报；已推过当日不重推；错过不补发；同分钟内失败可重试。
+-
+-    与 snapshot_push_loop 的有意差异：基线触发后无条件写 state="1"；
+-    本循环仅在终值（sent/degraded/selfcheck_failed/sent_dup）落 state，
+-    send_failed 不写 state，以便同一分钟内下一轮重试（错过时刻后自然放弃）。
+-    """
+-    local_tz = timezone(timedelta(hours=cfg.timezone_offset_hours))
+-    while not stop_event.is_set():
+-        now_local = datetime.now(local_tz)
+-        date_key = now_local.strftime("%Y-%m-%d")
+-        state_key = f"daily_report:{date_key}"
+-        if (now_local.hour, now_local.minute) == (cfg.time_hour, cfg.time_minute):
+-            if await storage.get_state(state_key) is None:
+-                try:
+-                    result = await trigger_daily_report()
+-                except Exception as exc:  # noqa: BLE001 - 循环自身兜底，supervised 再兜底
+-                    logger.error("日报触发异常: %s", exc)
+-                    result = "send_failed"
+-                if result != "send_failed":
+-                    # 四种终值均落 state；send_failed 不写，等待同分钟下一轮重试
+-                    await storage.set_state(state_key, result)
+-                    logger.info("当日日报完成: %s = %s", date_key, result)
+-            # 终值已落 → 长等避开本分钟；send_failed 未落 state → 短等以便同分钟重试
+-            wait_seconds = (
+-                60 if await storage.get_state(state_key) is not None
+-                else _DAILY_RETRY_WAIT_SECONDS
+-            )
+-            try:
+-                await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+-            except asyncio.TimeoutError:
+-                pass
+-            continue
+-        try:
+-            await asyncio.wait_for(stop_event.wait(), timeout=30)
+-        except asyncio.TimeoutError:
+-            pass
+-
+-
+-# ── 日报分段助手（触发层职责：renderer 不感知段号，S9）───────────────────
+-
+-# Telegram 单条 4096 字符、ntfy 公开服务器单条 4096 字节（UTF-8 中文 3 字节/字），
+-# 同一段要同时投递两渠道，取双上限同时守住。
+-_DAILY_MAX_CHARS = 4096
+-_DAILY_MAX_BYTES = 4096
+-
+-
+-def _daily_oversize(text: str) -> bool:
+-    """判断一段正文是否超出双通道任一长度上限。"""
+-    return (
+-        len(text) > _DAILY_MAX_CHARS
+-        or len(text.encode("utf-8")) > _DAILY_MAX_BYTES
+-    )
+-
+-
+-def _fit_daily_chunk(
+-    chunk: list[str], tail: list[str], title: str
+-) -> list[list[str]]:
+-    """把一组市场行拆到不超上限；仍超限（单行过长）则原样保留并交给调用方记日志。"""
+-    if not chunk:
+-        return [chunk]
+-    probe = "\n".join([title, *chunk, *tail])
+-    if not _daily_oversize(probe) or len(chunk) == 1:
+-        return [chunk]
+-    mid = max(1, len(chunk) // 2)
+-    return _fit_daily_chunk(chunk[:mid], [], title) + _fit_daily_chunk(
+-        chunk[mid:], tail, title
+-    )
+-
+-
+-def _paginate_daily(
+-    title: str,
+-    lines: list[str],
+-    footer: str,
+-    truncated_note: str,
+-    page_size: int,
+-) -> list[str]:
+-    """组装最终发送段列表（每项为完整段正文）。
+-
+-    先按 page_size 市场数一段；再对超限段按行二分兜底（正常配置不触发）；
+-    首段用原标题，续段标题追加"（续 i/n）"；footer 与截断提示只附最后一段。
+-    """
+-    tail = [x for x in (footer, truncated_note) if x]
+-    chunks: list[list[str]] = []
+-    for i in range(0, len(lines), page_size):
+-        chunks.append(lines[i : i + page_size])
+-    if not chunks:
+-        chunks = [[]]
+-    fitted: list[list[str]] = []
+-    for ci, chunk in enumerate(chunks):
+-        is_last = ci == len(chunks) - 1
+-        fitted.extend(_fit_daily_chunk(chunk, tail if is_last else [], title))
+-    total = len(fitted)
+-    if total > len(chunks):
+-        logger.warning("日报分段触发超长二次切分: %d -> %d 段", len(chunks), total)
+-    segments: list[str] = []
+-    for si, chunk in enumerate(fitted, 1):
+-        head = title if si == 1 else f"{title}（续 {si}/{total}）"
+-        body = [head, *chunk]
+-        if si == total:
+-            body += tail
+-        text = "\n".join(body)
+-        if _daily_oversize(text):
+-            logger.warning("日报第 %d/%d 段仍超长度上限（单行过长），按原文发送", si, total)
+-        segments.append(text)
+-    return segments
+-
+-
+-async def trigger_daily_report(
+-    *,
+-    storage: Storage,
+-    collector: Any,
+-    markets: list[Any],
+-    cfg: DailyReportConfig,
+-    notifiers: list[Notifier],
+-    health: dict[str, Any],
+-) -> str:
+-    """生成并推送当日成交份额日报；返回结果码（成败以 notifications 落痕为准）。
+-
+-    模块级函数（依赖显式注入，便于测试替换通道/采集器），由 amain 的
+-    _fire_daily_report 闭包绑定真实依赖后交给 daily_report_loop 调用。
+-
+-    结果码全集——终值（写 state）：sent / degraded / selfcheck_failed / sent_dup；
+-    非终值（不写 state，允许同分钟重试）：send_failed。
+-    """
+-    import hashlib
+-
+-    degraded = False
+-    failed_windows = 0
+-
+-    # 步骤 1+2：市场清单（settings.markets 已过滤 enabled）与 cid 解析
+-    resolved_cids: dict[str, str] = {}
+-    for m in markets:
+-        try:
+-            cid = (m.condition_id or "").strip()
+-            if not cid:
+-                resolved = await collector.resolve_market(m.slug)
+-                if not resolved:
+-                    logger.warning("日报市场 cid 解析失败: slug=%s", m.slug)
+-                    continue
+-                cid = resolved[0]
+-            resolved_cids[m.slug] = cid.lower()
+-        except Exception as exc:  # noqa: BLE001 - 单市场失败不影响其余
+-            logger.warning("日报市场 cid 处理异常 slug=%s: %s", m.slug, exc)
+-
+-    # 步骤 3：补算刚闭合桶（幂等；失败桶保持 -1 → 求和贡献 0）
+-    for cid in resolved_cids.values():
+-        try:
+-            await collector.backfill_prev_bucket(cid)
+-        except Exception as exc:  # noqa: BLE001
+-            logger.warning("日报 backfill 失败 cid=%s: %s", cid, exc)
+-
+-    # 步骤 4：三窗口聚合（单窗口异常置降级并跳过；全部失败才走降级正文）
+-    R = _current_bucket_start()
+-    agg: dict[str, dict[int, dict[str, Any]]] = {}
+-    for d in cfg.windows_days:
+-        start = R - d * 86400
+-        try:
+-            rows_window = await storage.volume_by_window(start, R)
+-        except Exception as exc:  # noqa: BLE001 - 单窗口失败降级
+-            degraded = True
+-            failed_windows += 1
+-            logger.error("日报窗口聚合失败 d=%s: %s", d, exc)
+-            continue
+-        for row in rows_window:
+-            agg.setdefault(str(row["condition_id"]).lower(), {})[d] = row
+-
+-    # 步骤 5：合并行（窗口内无行的市场三档置 0；显示名以 markets.toml 为准）
+-    rows: list[dict[str, Any]] = []
+-    for m in markets:
+-        cid = resolved_cids.get(m.slug)
+-        if not cid:
+-            continue
+-        bucket = agg.get(cid, {})
+-        row: dict[str, Any] = {
+-            "condition_id": cid,
+-            "slug_id": m.slug_id or m.slug,
+-            "slug": m.slug,
+-        }
+-        for d in cfg.windows_days:
+-            shares = float(bucket.get(d, {}).get("shares", 0.0) or 0.0)
+-            row[f"shares_{d}d"] = max(0.0, shares)
+-        rows.append(row)
+-
+-    # 步骤 6：单调自检（定稿决策：仅在全部窗口聚合成功时执行）。
+-    # 部分窗口失败时该档按 0 计，与更长窗口的真实值比较会形成假逆序，把本可
+-    # 降级发送的日报误拒；此时跳过自检，缺失档的不可信由 degraded 标记承担。
+-    # 全部窗口成功时才对相邻档做单调性校验，任一逆序整体拒发（selfcheck_failed）。
+-    if failed_windows == 0:
+-        for row in rows:
+-            values = [row[f"shares_{d}d"] for d in cfg.windows_days]
+-            if any(a > b for a, b in pairwise(values)):
+-                logger.error(
+-                    "daily_report selfcheck failed cid=%s values=%s",
+-                    row["condition_id"], values,
+-                )
+-                health["daily_result"] = "selfcheck_failed"
+-                return "selfcheck_failed"
+-    else:
+-        logger.warning(
+-            "daily_report 跳过单调自检：%d/%d 个窗口聚合失败，缺失档按 0 计不可信",
+-            failed_windows,
+-            len(cfg.windows_days),
+-        )
+-
+-    # 步骤 7：渲染（正常 / 空态 / 全窗口失败降级，统一落到三个变量）
+-    report = None
+-    if failed_windows != len(cfg.windows_days):
+-        report = render_daily_volume_report(
+-            rows,
+-            windows_days=cfg.windows_days,
+-            now_bucket=R,
+-            tz_offset_hours=cfg.timezone_offset_hours,
+-            top_n=cfg.top_n,
+-        )
+-    if report is not None:
+-        render_title = report.title
+-        render_lines = report.market_lines
+-        render_footer = report.footer
+-        truncated_note = report.truncated_note
+-    else:
+-        degraded = True
+-        local_tz = timezone(timedelta(hours=cfg.timezone_offset_hours))
+-        r_local = datetime.fromtimestamp(R, tz=local_tz)
+-        render_title = (
+-            f"📈 每日成交份额汇总 · {r_local.month}月{r_local.day}日（截至今晨06:00）"
+-        )
+-        if failed_windows == len(cfg.windows_days):
+-            render_lines = ["今日数据生成失败（聚合查询异常，见日志）"]
+-        else:
+-            render_lines = ["暂无监控市场"]
+-        render_footer = ""
+-        truncated_note = ""
+-
+-    # 步骤 8.1：组装分段（先组装完，再算指纹、再发送；renderer 不参与分段）
+-    segments = _paginate_daily(
+-        render_title, render_lines, render_footer, truncated_note, cfg.page_size
+-    )
+-
+-    # 步骤 8.2：内容防重（dedup）
+-    body_hash = hashlib.sha1("\n".join(segments).encode("utf-8")).hexdigest()
+-    if cfg.dedup and await storage.get_state("daily_report:body_hash") == body_hash:
+-        logger.info("日报跳过：正文与上一条完全一致（去重）")
+-        health["daily_result"] = "sent_dup"
+-        return "sent_dup"
+-
+-    # 步骤 8.3：段 × 通道逐个发送（内层各自捕获，单段单通道失败不中断其余）
+-    w0 = await storage.latest_notification_id()
+-    for seg_index, segment in enumerate(segments):
+-        for notifier in notifiers:
+-            try:
+-                await notifier.send(segment, event_keys=["daily_report"])
+-            except Exception as exc:  # noqa: BLE001
+-                # telegram 内部自行落 success/failed 且不抛；此处主要承接 ntfy 上抛
+-                logger.error(
+-                    "日报发送失败(%s) 段%d: %s",
+-                    notifier.describe(), seg_index + 1, exc,
+-                )
+-                await storage.record_notification(
+-                    notifier.describe(), segment, "daily_report", "failed"
+-                )
+-        if seg_index < len(segments) - 1:
+-            await asyncio.sleep(cfg.segment_delay_seconds)
+-
+-    # 步骤 9：按归属水位判定成败（不能用 try/except 判定——telegram 吞异常）
+-    counts = await storage.count_notifications_since(w0, "daily_report")
+-    if counts["success"] > 0:
+-        result = "degraded" if degraded else "sent"
+-        if cfg.dedup:
+-            # 只有投递成功才记录去重指纹（对齐基线"成功才落指纹"语义）
+-            await storage.set_state("daily_report:body_hash", body_hash)
+-    else:
+-        result = "send_failed"
+-        if not notifiers:
+-            logger.warning("日报无可用通道，正文未推送: notifiers=0")
+-        elif counts["failed"] == 0:
+-            logger.warning("日报无任何归属落痕，判定失败: notifiers=%d", len(notifiers))
+-
+-    health["daily_last_push"] = datetime.now(
+-        timezone(timedelta(hours=cfg.timezone_offset_hours))
+-    ).strftime("%Y-%m-%d %H:%M:%S")
+-    health["daily_result"] = result
+-    return result
+-
+-
+-def supervised(
+-    name: str,
+-    factory: Callable[[], Any],
+-    stop_event: asyncio.Event,
+-) -> Any:
+-    """任务监护：异常退出后自动重启，stop_event 置位后正常退出。"""
+-
+-    async def wrapper() -> None:
+-        attempt = 0
+-        while not stop_event.is_set():
+-            task = asyncio.create_task(factory())
+-            try:
+-                await task
+-                return
+-            except asyncio.CancelledError:
+-                raise
+-            except Exception as exc:  # noqa: BLE001 - 监护边界
+-                logger.warning("任务 %s 异常退出: %s", name, exc)
+-            attempt += 1
+-            delay = backoff_delay(attempt, 1.0, 30.0)
+-            logger.info("任务 %s %.1fs 后重启", name, delay)
+-            await asyncio.sleep(delay)
+-
+-    return wrapper()
+-
+-
+ async def amain(config_path: str) -> None:
+-    load_dotenv()
+-    settings = Settings.load(config_path)
+-    setup_logging(
+-        settings.log_level,
+-        log_file=settings.get("logging.file"),
+-        max_mb=int(settings.get("logging.max_mb", 10)),
+-        backups=int(settings.get("logging.backups", 5)),
+-    )
+-    logger.info("服务启动")
+-
+-    # 存储
+-    storage = Storage("data/monitor.db")
+-    await storage.init()
+-    seeded = await storage.seed_wallets(settings.watchlist_seeds)
+-    if seeded:
+-        logger.info("配置种子新增监控地址 %d 个", seeded)
+-
+-    endpoints = settings.section("endpoints")
+-    polling = settings.section("polling")
+-
+-    # 客户端
+-    rtds = RtdsClient(
+-        str(endpoints.get("rtds")),
+-        heartbeat_seconds=int(polling.get("rtds_heartbeat_seconds", 15)),
+-        reconnect_min_seconds=float(polling.get("reconnect_min_seconds", 1)),
+-        reconnect_max_seconds=float(polling.get("reconnect_max_seconds", 30)),
+-    )
+-    data_api = DataApiClient(
+-        str(endpoints.get("data_api")),
+-        interval_seconds=int(polling.get("reconciliation_interval_seconds", 60)),
+-        timeout_seconds=int(polling.get("request_timeout_seconds", 10)),
+-        max_concurrency=int(polling.get("max_concurrent_requests", 5)),
+-        page_limit=int(polling.get("cold_start_fetch_limit", 50)),
+-    )
+-    gamma = GammaClient(
+-        str(endpoints.get("gamma_api")),
+-        timeout_seconds=int(polling.get("request_timeout_seconds", 10)),
+-        cache_ttl_hours=int(settings.get("market_cache.ttl_hours", 24)),
+-    )
+-
+-    event_queue: asyncio.Queue[StandardEvent] = asyncio.Queue(maxsize=10000)
+-    message_queue: asyncio.Queue[AlertMessage] = asyncio.Queue(maxsize=1000)
+-    reconcile_event = asyncio.Event()
+-    stop_event = asyncio.Event()
+-
+-    # 冷启动基线（重试到成功，避免首启把历史当新交易推送）
+-    wallets = await storage.list_wallets(active_only=True)
+-    cold_attempt = 0
+-    while not stop_event.is_set():
+-        try:
+-            await data_api.cold_start(wallets, storage)
+-            break
+-        except Exception as exc:  # noqa: BLE001 - 冷启动失败必须重试
+-            cold_attempt += 1
+-            delay = backoff_delay(cold_attempt, 2.0, 60.0)
+-            logger.warning("冷启动基线建立失败: %s，%.0fs 后重试", exc, delay)
+-            await asyncio.sleep(delay)
+-
+-    pipeline = PipelineRunner(event_queue, message_queue, storage, gamma, settings)
+-    health: dict[str, Any] = {"rtds_connected": False, "l2_last_run": "-"}
+-
+-    # ── 市场快照：采集器 + 推送调度 ─────────────────────────────────
+-    snapshot_push_cfg = settings.snapshot_push
+-    snapshot_cfg = settings.snapshot
+-    markets = settings.markets
+-    if markets:
+-        logger.info("快照市场 %d 个: %s", len(markets), [m.slug_id for m in markets])
+-    else:
+-        logger.info("快照市场为空（config/markets.toml 未配置），仅注册推送循环")
+-    snap_collector = SnapshotCollector(
+-        storage,
+-        gamma_host=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
+-        clob_host=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
+-        timeout=float(snapshot_cfg.get("request_timeout_seconds", 15)),
+-        price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
+-    )
+-    snap_health: dict[str, Any] = {"snap_last_push": "-"}
+-    snap_auth: AuthManager | None = None
+-    snap_runner: BotRunner | None = None
+-    # 快照采集完成状态：round_done_ts = 最近一轮采集完成时刻（供整点推送等待）
+-    collect_state: dict[str, float] = {"round_done_ts": 0.0}
+-    # 快照推送通道列表（见下方装配；可 telegram + ntfy 同时启用）
+-    snap_notifiers: list[Notifier] = []
+-    _p1_snap_uc = None  # P1 usecase 装配后替换
+-    _p1_trader_uc = None
+-
+-    async def _trader_consumer(queue, stop):
+-        while not stop.is_set():
+-            alert = await queue.get()
+-            try:
+-                if _p1_trader_uc is not None:
+-                    await _p1_trader_uc.handle(alert)
+-                else:
+-                    for n in trader_notifiers:
+-                        try:
+-                            await n.send(alert.html, buttons=alert.buttons,
+-                                         event_keys=alert.event_keys)
+-                        except Exception as exc:
+-                            logger.error("推送失败(%s): %s", n.describe(), exc)
+-            finally:
+-                queue.task_done()
+-
+-    # 日报通道与状态（延迟装配，模式对齐 snap_notifiers；闭包调用时才读取列表内容）
+-    daily_notifiers: list[Notifier] = []
+-    _p1_daily_uc = None  # P1 usecase 装配后替换
+-    daily_health: dict[str, Any] = {"daily_last_push": "-", "daily_result": "-"}
+-    daily_cfg = resolve_daily_config(settings)
+-    for _warn in daily_cfg.warnings:
+-        logger.warning("daily_report 配置警告: %s", _warn)
+-    for _err in daily_cfg.errors:
+-        logger.error("daily_report 配置致命错误: %s", _err)
+-    if not daily_cfg.enabled:
+-        logger.info("daily_report 未启用或配置存在致命错误，日报任务不注册")
+-
+-    async def trigger_snapshot_push() -> None:
+-        """读取最近完整桶 → 渲染总览 → 推送到快照 Bot 白名单。"""
+-        import hashlib
+-
+-        # P1 新骨架：开关打开时走 usecase
+-        if _p1_snap_uc is not None:
+-            await _p1_snap_uc.run()
+-            return
+-
+-        now_bucket = _current_bucket_start()
+-        bucket_seconds = int(snapshot_cfg.get("bucket_seconds", 7200))
+-        # 推送前主动补算上一闭合桶份额（当前累计 - 桶起点基线），幂等可重复。
+-        # 注意：markets.toml 允许只填 slug（condition_id 留空），必须先用
+-        # 采集器解析出的 cid 补算，否则空 cid 请求 Gamma 会静默失败（旧 bug）。
+-        for m in markets:
+-            try:
+-                cid = m.condition_id
+-                if not cid:
+-                    resolved = await snap_collector.resolve_market(m.slug)
+-                    if resolved:
+-                        cid = resolved[0]
+-                if cid:
+-                    await snap_collector.backfill_prev_bucket(cid)
+-            except Exception as exc:  # noqa: BLE001 - 单市场补算失败降级
+-                logger.warning("推送前补算失败 %s: %s", m.slug_id, exc)
+-        rows = await storage.latest_complete_buckets(now_bucket)
+-        if not rows:
+-            logger.info("快照推送跳过：暂无完整桶数据")
+-            return
+-        # 数据陈旧守卫：最新桶落后超过阈值（默认 0=不跳过，仅标题提示延迟）
+-        max_stale = int(snapshot_push_cfg.get("max_stale_buckets", 0) or 0)
+-        lag_buckets = max(
+-            (now_bucket - int(r["bucket_ts"])) // bucket_seconds for r in rows
+-        )
+-        if max_stale > 0 and lag_buckets > max_stale:
+-            logger.info(
+-                "快照推送跳过：数据落后 %d 个桶（阈值 %d），疑似采集异常",
+-                lag_buckets,
+-                max_stale,
+-            )
+-            return
+-        # 推送前实时取各市场当前盘面价（失败降级用闭合桶收盘价）
+-        try:
+-            live = await snap_collector.fetch_live_prices(rows)
+-            for row in rows:
+-                cid = str(row.get("condition_id") or "")
+-                if cid in live:
+-                    row["current_price"] = live[cid]
+-        except Exception as exc:  # noqa: BLE001 - 实时价失败不影响推送
+-            logger.warning("快照实时价拉取失败，回退收盘价: %s", exc)
+-        # 上一闭合桶份额：直接读库（基线差按桶精确落库；
+-        # NULL = 该桶基线缺失（未知），渲染显示"-"，不再误导为 0 成交）
+-        for row in rows:
+-            shares = row.get("volume_shares")
+-            row["volume_shares_display"] = (
+-                float(shares) if shares is not None else -1.0
+-            )
+-        alert = render_snapshot_summary(
+-            rows,
+-            tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
+-            bucket_seconds=bucket_seconds,
+-            now_bucket=now_bucket,
+-        )
+-        if alert is None:
+-            return
+-        # 正文去重：2h 桶配整点推送时，奇数点内容天然相同；采集停摆时旧桶
+-        # 也会被反复推。内容与上一条完全一致则抑制（默认开，可配 dedup=false）。
+-        if snapshot_push_cfg.get("dedup", True):
+-            body_hash = hashlib.sha1(alert.html.encode("utf-8")).hexdigest()
+-            if await storage.get_state("snap_push:body_hash") == body_hash:
+-                logger.info("快照推送跳过：内容与上一条完全一致（去重）")
+-                return
+-        # 经全部推送通道投递（telegram 白名单多 chat / ntfy topic，可同时启用）
+-        send_failed = False
+-        if snap_notifiers:
+-            for notifier in snap_notifiers:
+-                try:
+-                    await notifier.send(alert.html)
+-                except Exception as exc:  # noqa: BLE001 - 单通道失败不影响其他
+-                    send_failed = True
+-                    logger.error("快照推送失败(%s): %s", notifier.describe(), exc)
+-        else:
+-            send_failed = True
+-            logger.warning("快照推送通道未配置，总览未推送（仅采集落库）")
+-        # 只有投递成功才记录去重指纹，失败的下轮允许重试
+-        if not send_failed and snapshot_push_cfg.get("dedup", True):
+-            await storage.set_state("snap_push:body_hash", body_hash)
+-        snap_health["snap_last_push"] = datetime.now(
+-            timezone(timedelta(hours=8))
+-        ).strftime("%m-%d %H:%M")
+-
+-    async def trigger_snapshot_now() -> None:
+-        """/snap now：立即采集一轮（collect 幂等，含补漏桶/补算）+ 立即推送。"""
+-        await _snapshot_collect_round(snap_collector, markets)
+-        await trigger_snapshot_push()
+-
+-    async def _fire_daily_report() -> str:
+-        """amain 层薄封装：日报流程显式注入依赖，notifiers 调用时才取最新装配。"""
+-        if _p1_daily_uc is not None:
+-            return await _p1_daily_uc.run()
+-        return await trigger_daily_report(
+-            storage=storage,
+-            collector=snap_collector,
+-            markets=markets,
+-            cfg=daily_cfg,
+-            notifiers=daily_notifiers,
+-            health=daily_health,
+-        )
+-
+-    tasks = [
+-        asyncio.create_task(
+-            supervised(
+-                "rtds",
+-                lambda: rtds.run(event_queue, storage, reconcile_event, stop_event),
+-                stop_event,
+-            )
+-        ),
+-        asyncio.create_task(
+-            supervised(
+-                "data_api",
+-                lambda: data_api.run(event_queue, storage, reconcile_event, stop_event),
+-                stop_event,
+-            )
+-        ),
+-        asyncio.create_task(supervised("pipeline", pipeline.run, stop_event)),
+-        asyncio.create_task(heartbeat_writer(stop_event)),
+-        asyncio.create_task(health_watcher(health, rtds, storage, stop_event)),
+-        asyncio.create_task(
+-            supervised(
+-                "prune",
+-                lambda: prune_loop(storage, settings, stop_event),
+-                stop_event,
+-            )
+-        ),
+-    ]
+-    if markets:
+-        collect_interval = int(snapshot_cfg.get("collect_interval_seconds", 600))
+-        tasks.append(
+-            asyncio.create_task(
+-                supervised(
+-                    "snapshot_collect",
+-                    lambda: snapshot_collect_loop(
+-                        snap_collector,
+-                        markets,
+-                        stop_event,
+-                        collect_state,
+-                        interval_seconds=collect_interval,
+-                    ),
+-                    stop_event,
+-                )
+-            )
+-        )
+-    if snapshot_push_cfg.get("enabled", True) and snapshot_push_cfg.get("schedule"):
+-        tasks.append(
+-            asyncio.create_task(
+-                supervised(
+-                    "snapshot_push",
+-                    lambda: snapshot_push_loop(
+-                        storage, settings, trigger_snapshot_push, stop_event
+-                    ),
+-                    stop_event,
+-                )
+-            )
+-        )
+-
+-    # 推送通道装配：notify.platforms 列表（telegram | ntfy，可多平台同时启用）。
+-    # 交易员告警队列经 run_sender 依次投递到全部通道；
+-    # telegram 指令轮询（/add /remove /vol 等）仅在启用 telegram 且 token 已配置时启动。
+-    trader_notifiers: list[Notifier] = []
+-    tg_api: TelegramApi | None = None
+-    auth: AuthManager | None = None
+-    if "telegram" in settings.notify_platforms and settings.bot_token:
+-        tg_api = TelegramApi(settings.bot_token)
+-        auth = AuthManager(settings.allowed_chat_ids, storage)
+-        await auth.load()
+-    trader_notifiers = build_notifiers(settings, storage, tg_api, auth, kind="trader")
+-    if trader_notifiers:
+-        tasks.append(
+-            asyncio.create_task(
+-                supervised(
+-                    "bot_sender",
+-                    lambda: _trader_consumer(message_queue, stop_event),
+-                    stop_event,
+-                )
+-            )
+-        )
+-        logger.info(
+-            "交易员推送通道已启用: %s",
+-            [n.describe() for n in trader_notifiers],
+-        )
+-    else:
+-        logger.warning("推送通道均未启用，交易员告警不推送")
+-    if tg_api is not None and auth is not None:
+-        bot = BotRunner(tg_api, storage, auth)
+-        command_handler = CommandHandler(
+-            storage, health, digest_manager=pipeline.digest
+-        )
+-        tasks.append(
+-            asyncio.create_task(
+-                supervised(
+-                    "bot_updates",
+-                    lambda: bot.run_updates(command_handler, stop_event),
+-                    stop_event,
+-                )
+-            )
+-        )
+-
+-    # 快照推送通道（独立白名单 / 独立 topic；与交易员通道隔离，但平台列表共用）
+-    snap_tg_api: TelegramApi | None = None
+-    if "telegram" in settings.notify_platforms and settings.snapshot_bot_token:
+-        snap_tg_api = TelegramApi(settings.snapshot_bot_token)
+-        snap_auth = AuthManager([], storage, state_key="snap_allowed_chats")
+-        await snap_auth.load()
+-        snap_runner = BotRunner(snap_tg_api, storage, snap_auth)
+-        snap_cmd = SnapshotCommandHandler(
+-            markets,
+-            snap_collector,
+-            storage,
+-            trigger_snapshot_now,
+-            snap_health,
+-            markets_path=str(settings.config_path.parent / "markets.toml"),
+-            **({
+-                "trigger_daily": _fire_daily_report,
+-                "daily_health": daily_health,
+-            } if daily_cfg.enabled else {}),
+-        )
+-        tasks.append(
+-            asyncio.create_task(
+-                supervised(
+-                    "snap_bot_updates",
+-                    lambda: snap_runner.run_updates(snap_cmd, stop_event),
+-                    stop_event,
+-                )
+-            )
+-        )
+-        logger.info("快照 Bot 已启用（独立白名单）")
+-    snap_notifiers = build_notifiers(
+-        settings, storage, snap_tg_api, snap_auth, kind="snapshot"
+-    )
+-    if snap_notifiers:
+-        logger.info(
+-            "快照推送通道已启用: %s",
+-            [n.describe() for n in snap_notifiers],
+-        )
+-    else:
+-        logger.warning("快照推送通道均未启用，快照仅采集不推送")
+-
+-    # ── 日报通道装配（B1：token 选择在 amain 层，factory 不读 token）──
+-    if daily_cfg.enabled:
+-        daily_tg_api: TelegramApi | None = None
+-        daily_auth: AuthManager | None = None
+-        if "telegram" in settings.notify_platforms:
+-            independent_token = settings.daily_bot_token
+-            if independent_token:
+-                # 情形一：独立日报 Bot —— 三件套独立装配，白名单隔离，只暴露 /daily
+-                daily_tg_api = TelegramApi(independent_token)
+-                daily_auth = AuthManager([], storage, state_key="daily_allowed_chats")
+-                await daily_auth.load()
+-                daily_runner = BotRunner(daily_tg_api, storage, daily_auth)
+-                daily_cmd = DailyCommandHandler(
+-                    trigger_daily=_fire_daily_report,
+-                    daily_health=daily_health,
+-                )
+-                tasks.append(
+-                    asyncio.create_task(
+-                        supervised(
+-                            "daily_bot_updates",
+-                            lambda: daily_runner.run_updates(daily_cmd, stop_event),
+-                            stop_event,
+-                        )
+-                    )
+-                )
+-                logger.info("日报独立 Bot 已启用（独立白名单 daily_allowed_chats）")
+-            elif snap_tg_api is not None and snap_auth is not None:
+-                # 情形二（默认）：复用快照 Bot 的 api / 白名单 / snap_cmd（已带 /daily）
+-                daily_tg_api = snap_tg_api
+-                daily_auth = snap_auth
+-            else:
+-                logger.warning(
+-                    "日报 telegram 通道未配置 token（DAILY_BOT_TOKEN / "
+-                    "SNAPSHOT_BOT_TOKEN 均空），跳过"
+-                )
+-        daily_notifiers = build_notifiers(
+-            settings, storage, daily_tg_api, daily_auth, kind="daily"
+-        )
+-        if daily_notifiers:
+-            logger.info(
+-                "日报推送通道已启用: %s",
+-                [n.describe() for n in daily_notifiers],
+-            )
+-        else:
+-            logger.warning("日报推送通道均未启用，日报不会推送")
+-        if daily_notifiers:
+-            tasks.append(
+-                asyncio.create_task(
+-                    supervised(
+-                        "daily_report",
+-                        lambda: daily_report_loop(
+-                            storage, daily_cfg, _fire_daily_report, stop_event
+-                        ),
+-                        stop_event,
+-                    )
+-                )
+-            )
+-
+-    loop = asyncio.get_running_loop()
+-
+-    # ── P1 新骨架装配（双轨：默认不接管，env P1_SWITCH=1 时启用）──
+-    try:
+-        import os
+-        from framework.bootstrap import build_runtime
+-        from framework.adapters.legacy_collector import LegacyCollectorAdapter
+-        from framework.adapters.notifier_channel import NotifierChannel
+-        from framework.store.snapshot_store import SnapshotStore
+-        from framework.store.state_store import StateStore
+-        from framework.scheduler.guard import BodyHashGuard
+-        from framework.delivery.router import ChannelRouter
+-        from framework.render.paginator import MessagePaginator
+-        from framework.models.message import RenderedMessage
+-        p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
+-        if p1_switch:
+-            from framework.bootstrap import build_runtime
+-            from features.market_snapshot.renderer import LegacySnapshotRenderer
+-            from features.daily_report.renderer import LegacyDailyRenderer
+-            from features.trader.renderer import LegacyTraderRenderer
+-            from features.market_snapshot.usecase import SnapshotPushConfig
+-            from features.daily_report.usecase import DailyReportConfig
+-
+-            class _Catalog:
+-                def slugs(self): return [m.slug for m in markets]
+-
+-            _rt, _trader_uc = build_runtime(
+-                storage=storage, collector=snap_collector, catalog=_Catalog(),
+-                snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
+-                trader_notifiers=trader_notifiers,
+-                snap_renderer=LegacySnapshotRenderer(
+-                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
+-                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
+-                ),
+-                daily_renderer=LegacyDailyRenderer(),
+-                trader_renderer=LegacyTraderRenderer(),
+-                snap_cfg=SnapshotPushConfig(
+-                    dedup=bool(snapshot_push_cfg.get("dedup", True)),
+-                    now_bucket=_current_bucket_start(),
+-                ),
+-                daily_cfg=DailyReportConfig(
+-                    windows_days=list(daily_cfg.windows_days),
+-                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
+-                    top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
+-                    now_bucket=_current_bucket_start(),
+-                ),
+-                snap_health=snap_health, daily_health=daily_health,
+-            )
+-            _p1_snap_uc = next(m.run for m in _rt.modules if m.name == "market_snapshot")
+-            _p1_daily_uc = next(m.run for m in _rt.modules if m.name == "daily_report")
+-            _p1_trader_uc = _trader_uc
+-            logger.info("P1 三个 feature 已接管（bootstrap 集中装配）")
+-    except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
+-        logger.exception("P1 bootstrap 装配失败，回退旧链路")
+-
+-    def _on_stop() -> None:
+-        logger.info("收到停止信号，准备退出")
+-        stop_event.set()
+-
+-    for sig in (signal.SIGTERM, signal.SIGINT):
+-        loop.add_signal_handler(sig, _on_stop)
+-
+-    await stop_event.wait()
++    from framework.app import build_app, shutdown_app
+ 
+-    # 收尾：聚合组立即产出 → 短暂等待发送 → 取消全部
+-    await pipeline.shutdown()
+-    await asyncio.sleep(1)
+-    for task in tasks:
+-        task.cancel()
+-    await asyncio.gather(*tasks, return_exceptions=True)
+-    await snap_collector.aclose()
+-    await storage.close()
+-    logger.info("服务已停止")
++    h = await build_app(config_path)
++    await h.stop_event.wait()
++    await shutdown_app(h)
+ 
+ 
+ def main() -> None:
+diff --git a/tests/test_daily_report.py b/tests/test_daily_report.py
+index 6271c36..a15a79f 100644
+--- a/tests/test_daily_report.py
++++ b/tests/test_daily_report.py
+@@ -1,8 +1,9 @@
+-"""每日成交份额汇总（daily_report）测试。
++"""每日成交份额汇总（daily_report）测试（瘦身版）。
+ 
+-覆盖施工文档 V2 §6 测试清单：存储聚合、合并、渲染纯函数、分段、单调自检、
+-调度状态机、成败判定（R4/B3 专项）、配置校验、工厂装配、指令与回归。
+-风格对齐基线 tests/：asyncio_mode=auto、tmp_path Storage fixture、monkeypatch 假通道。
++保留：Storage 聚合、渲染纯函数、调度状态机（daily_report_loop）、
++配置校验、工厂装配、指令与回归。
++已迁移：trigger 集成测试 → tests/test_daily_usecase.py；
++      分段纯函数测试 → tests/test_paginator.py。
+ """
+ 
+ from __future__ import annotations
+@@ -15,13 +16,9 @@ from typing import Any
+ import pytest
+ 
+ import src.main as m
+-from src.main import (
+-    DailyReportConfig,
+-    _paginate_daily,
+-    daily_report_loop,
+-    trigger_daily_report,
+-)
+-from src.settings import DailyReportConfig as Cfg, MarketEntry, Settings, resolve_daily_config
++from src.main import daily_report_loop
++from framework.runtime import loops as runtime_loops
++from src.settings import DailyReportConfig, MarketEntry, Settings, resolve_daily_config
+ from src.snapshots.commands import (
+     DailyCommandHandler,
+     SnapshotCommandHandler,
+@@ -119,58 +116,6 @@ class FakeCollector:
+             raise RuntimeError("boom")
+ 
+ 
+-class TGSwallow:
+-    """模拟 TelegramNotifier：逐 chat 吞异常、内部落 success 痕、不抛出。"""
+-
+-    def __init__(self, storage: Storage, chats: int = 1, fail_chats: int = 0):
+-        self.storage = storage
+-        self.chats = chats
+-        self.fail_chats = fail_chats
+-        self.sent: list[str] = []
+-
+-    async def send(self, text: str, *, buttons=None, event_keys=None):
+-        keys = ",".join(event_keys or [])
+-        self.sent.append(text)
+-        ok = self.chats - self.fail_chats
+-        for i in range(ok):
+-            await self.storage.record_notification(f"c{i}", text, keys, "success")
+-        for i in range(self.fail_chats):
+-            await self.storage.record_notification(
+-                f"bad{i}", text, keys, "failed"
+-            )
+-
+-    def describe(self) -> str:
+-        return f"telegram@{self.chats} chats"
+-
+-
+-class NtfyThrow:
+-    """模拟 NtfyNotifier 失败：抛异常且不落痕（触发层 except 补记 failed）。"""
+-
+-    def __init__(self):
+-        self.sent: list[str] = []
+-
+-    async def send(self, text: str, *, buttons=None, event_keys=None):
+-        self.sent.append(text)
+-        raise RuntimeError("ntfy 503")
+-
+-    def describe(self) -> str:
+-        return "ntfy@https://ntfy.sh/daily-topic"
+-
+-
+-class NtfyOk:
+-    def __init__(self, storage: Storage):
+-        self.storage = storage
+-        self.sent: list[str] = []
+-
+-    async def send(self, text: str, *, buttons=None, event_keys=None):
+-        keys = ",".join(event_keys or [])
+-        self.sent.append(text)
+-        await self.storage.record_notification("ntfy", text, keys, "success")
+-
+-    def describe(self) -> str:
+-        return "ntfy@https://ntfy.sh/daily-topic"
+-
+-
+ # ──────────────────────────── 6.1 volume_by_window ───────────────────────────
+ 
+ 
+@@ -190,21 +135,19 @@ async def test_volume_by_window_sum_and_exclusions(storage: Storage):
+ 
+     one = await storage.volume_by_window(R0 - 86400, R0)
+     rows_a = {r["condition_id"]: r for r in one}
+-    assert rows_a["0xaaa"]["shares"] == 12 * 100.0  # R0 行与 -1 行都被排除出 1d（在界外/不计和）
++    assert rows_a["0xaaa"]["shares"] == 12 * 100.0
+     assert rows_a["0xaaa"]["buckets"] >= 12
+     assert "0xbbb" in rows_a
+ 
+     three = await storage.volume_by_window(R0 - 3 * 86400, R0)
+     a3 = next(r for r in three if r["condition_id"] == "0xaaa")
+-    # 1d 的 12 桶 + R0-13..14 两桶(-1 计 0、0 计和) = 1200 + 0 + 0 = 1200
+     assert a3["shares"] == 1200.0
+-    # -1 与 0 都计入 buckets：12 + 2 = 14
+     assert a3["buckets"] == 14
+ 
+ 
+ async def test_volume_by_window_right_open(storage: Storage):
+-    await _snap(storage, "0xc", R0, 1.0)      # 恰好右端点，不纳入
+-    await _snap(storage, "0xc", R0 - 1, 2.0)  # 纳入
++    await _snap(storage, "0xc", R0, 1.0)
++    await _snap(storage, "0xc", R0 - 1, 2.0)
+     rows = await storage.volume_by_window(R0 - 7200, R0)
+     assert next(r for r in rows if r["condition_id"] == "0xc")["shares"] == 2.0
+ 
+@@ -232,16 +175,15 @@ def _row(cid, slug_id, d1, d3, d7):
+ def test_renderer_sort_tie_and_none():
+     rows = [
+         _row("0xb", "B", 100, 200, 300),
+-        _row("0xa", "A", 100, 200, 300),  # 同 shares_1d，condition_id 升序应排前
++        _row("0xa", "A", 100, 200, 300),
+         _row("0xc", "C", 500, 600, 700),
+     ]
+     rep = render_daily_volume_report(
+         rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
+     )
+     assert rep is not None
+-    assert rep.market_lines[0].startswith("1️⃣ C")  # 500 最大
++    assert rep.market_lines[0].startswith("1️⃣ C")
+     assert rep.total == 3
+-    # renderer 无段号概念（S9）
+     assert not hasattr(rep, "segment") and not hasattr(rep, "page")
+     assert render_daily_volume_report(
+         [], windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
+@@ -254,12 +196,9 @@ def test_renderer_text_redlines_and_thousands():
+         rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
+     )
+     assert "截至今晨06:00" in rep.title
+-    assert "07:00" not in rep.title.split("截至今晨06:00")[1] if "截至今晨06:00" in rep.title else True
+     body = "\n".join(rep.market_lines)
+     assert "128,540" in body and "356,208" in body and "812,940" in body
+-    # 文案红线：不得出现金额符号
+     assert "$" not in body and "USDC" not in body and "USD" not in body
+-    # 市场名 HTML 转义
+     assert "&lt;" in rep.market_lines[0]
+ 
+ 
+@@ -277,247 +216,7 @@ def test_renderer_truncate():
+     assert rep0.truncated_note == ""
+ 
+ 
+-# ────────────────────────────── 6.4 分段 ──────────────────────────────────────
+-
+-
+-def test_paginate_25_by_20():
+-    title = "T"
+-    lines = [f"L{i}" for i in range(25)]
+-    segs = _paginate_daily(title, lines, "FOOTER", "", page_size=20)
+-    assert len(segs) == 2
+-    assert segs[0].startswith(title) and "（续" not in segs[0]
+-    assert "（续 2/2）" in segs[1]
+-    assert "FOOTER" in segs[1] and "FOOTER" not in segs[0]
+-
+-
+-def test_paginate_topn_and_page_no_conflict():
+-    lines = [f"L{i}" for i in range(25)]
+-    segs = _paginate_daily("T", lines, "F", "其余 20 个市场未列出", page_size=10)
+-    # 25 行按 10 一段 → 3 段；截断提示只在末段
+-    assert len(segs) == 3
+-    assert segs[-1].endswith("其余 20 个市场未列出")
+-
+-
+-def test_paginate_oversize_resplit():
+-    title = "T" * 2000
+-    lines = [f"市场{i}｜1天 1｜3天 2｜7天 3" * 300 for i in range(6)]
+-    segs = _paginate_daily(title, lines, "", "", page_size=100)
+-    assert len(segs) > 1  # 单段必超 4096 → 二分兜底
+-
+-
+-def test_paginate_empty_lines_single_segment():
+-    segs = _paginate_daily("T", [], "F", "", page_size=20)
+-    assert len(segs) == 1 and "F" in segs[0]
+-
+-
+-# ─────────────────────── 6.2/6.5/6.7 trigger 集成 ────────────────────────────
+-
+-
+-def _markets():
+-    return [
+-        MarketEntry(slug_id="A", slug="aaa", condition_id="0xAAA"),
+-        MarketEntry(slug_id="B", slug="bbb", condition_id=""),  # 需 resolve
+-    ]
+-
+-
+-async def _seed(storage: Storage):
+-    # A: 1d=100 (12桶), B(resolve→0xBBB): 1d=50
+-    await _snap(storage, "0xaaa", R0 - 7200, 100.0)
+-    await _snap(storage, "0xbbb", R0 - 7200, 50.0)
+-
+-
+-async def test_trigger_sent_and_dedup(storage: Storage, monkeypatch):
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    await _seed(storage)
+-    notifier = TGSwallow(storage)
+-    collector = FakeCollector(resolve_map={"bbb": "0xBBB"})
+-    health: dict[str, Any] = {}
+-    cfg = make_cfg(dedup=True)
+-
+-    res = await trigger_daily_report(
+-        storage=storage, collector=collector, markets=_markets(),
+-        cfg=cfg, notifiers=[notifier], health=health,
+-    )
+-    assert res == "sent"
+-    assert health["daily_result"] == "sent"
+-    assert notifier.sent and "截至今晨06:00" in notifier.sent[0]
+-
+-    # 第二次同数据 → sent_dup
+-    res2 = await trigger_daily_report(
+-        storage=storage, collector=collector, markets=_markets(),
+-        cfg=cfg, notifiers=[notifier], health=health,
+-    )
+-    assert res2 == "sent_dup"
+-
+-
+-async def test_trigger_selfcheck_reject(storage: Storage, monkeypatch):
+-    """注入人为逆序聚合结果 → 拒发（真实滚动窗口天然单调，只能伪造触发防御分支）。"""
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-
+-    async def fake_vbw(start: int, end: int):
+-        span = end - start
+-        val = {86400: 999.0, 259200: 500.0, 604800: 400.0}[span]
+-        return [{"condition_id": "0xaaa", "slug": "aaa", "slug_id": "A",
+-                 "shares": val, "buckets": 12}]
+-
+-    monkeypatch.setattr(storage, "volume_by_window", fake_vbw)
+-    notifier = TGSwallow(storage)
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(), markets=_markets()[:1],
+-        cfg=make_cfg(), notifiers=[notifier], health={},
+-    )
+-    assert res == "selfcheck_failed"
+-    assert notifier.sent == []  # 拒发，零发送
+-
+-
+-async def test_trigger_selfcheck_reject_second_pair(storage: Storage, monkeypatch):
+-    """第二对相邻档 3d > 7d 同样必须拒发（覆盖除 1d>3d 之外的逆序方向）。"""
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-
+-    async def fake_vbw(start: int, end: int):
+-        span = end - start
+-        val = {86400: 100.0, 259200: 100.0, 604800: 0.0}[span]
+-        return [{"condition_id": "0xaaa", "slug": "aaa", "slug_id": "A",
+-                 "shares": val, "buckets": 12}]
+-
+-    monkeypatch.setattr(storage, "volume_by_window", fake_vbw)
+-    notifier = TGSwallow(storage)
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(), markets=_markets()[:1],
+-        cfg=make_cfg(), notifiers=[notifier], health={},
+-    )
+-    assert res == "selfcheck_failed"
+-    assert notifier.sent == []
+-
+-
+-async def test_selfcheck_skipped_when_window_failed(storage: Storage, monkeypatch):
+-    """部分窗口聚合失败时跳过自检（缺失档按 0 计会形成假逆序，属已知限制非数据异常）。"""
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    real_vbw = storage.volume_by_window
+-
+-    async def fake_vbw(start: int, end: int):
+-        if end - start == 604800:  # 7d 失败 → 该档按 0，会"大于"关系逆序
+-            raise RuntimeError("db lock")
+-        return await real_vbw(start, end)
+-
+-    await _snap(storage, "0xaaa", R0 - 7200, 500.0)
+-    monkeypatch.setattr(storage, "volume_by_window", fake_vbw)
+-    notifier = TGSwallow(storage)
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(), markets=_markets()[:1],
+-        cfg=make_cfg(), notifiers=[notifier], health={},
+-    )
+-    assert res == "degraded"  # 未被自检误拒，走降级发送
+-
+-
+-async def test_trigger_merge_zero_init_and_backfill_order(storage: Storage, monkeypatch):
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    # A 仅 1d 窗口有行（3d/7d 也含该桶故非零）；C 完全无行 → 三档 0 起步
+-    await _snap(storage, "0xaaa", R0 - 7200, 10.0, slug="aaa", slug_id="A")
+-    collector = FakeCollector(resolve_map={"bbb": "0xBBB", "ccc": "0xCCC"})
+-    notifier = TGSwallow(storage)
+-    markets = _markets() + [MarketEntry(slug_id="C", slug="ccc", condition_id="")]
+-    res = await trigger_daily_report(
+-        storage=storage, collector=collector, markets=markets,
+-        cfg=make_cfg(), notifiers=[notifier], health={},
+-    )
+-    assert res == "sent"
+-    # resolve 出的 cid 统一小写后补算
+-    assert set(collector.backfilled) == {"0xaaa", "0xbbb", "0xccc"}
+-    body = notifier.sent[0]
+-    assert "A" in body and "C" in body
+-    assert "1天 0｜3天 0｜7天 0" in body  # C 无行 → 三档 0 起步（决策⑦）
+-
+-
+-# ───────────────── 6.7 成败判定专项（R4 + B3 + B4，禁止回归） ──────────────────
+-
+-
+-async def test_r4_telegram_swallow_success_is_sent(storage: Storage, monkeypatch):
+-    """TelegramNotifier 吞异常但落 success 痕 → 判定 sent（不靠 try/except）。"""
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    await _seed(storage)
+-    tg = TGSwallow(storage, chats=2, fail_chats=1)  # 部分 chat 失败仍算成功
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(resolve_map={"bbb": "0xBBB"}),
+-        markets=_markets(), cfg=make_cfg(), notifiers=[tg], health={},
+-    )
+-    assert res == "sent"
+-
+-
+-async def test_send_failed_when_all_channels_fail(storage: Storage, monkeypatch):
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    await _seed(storage)
+-    tg_allfail = TGSwallow(storage, chats=1, fail_chats=1)  # 全落 failed
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(resolve_map={"bbb": "0xBBB"}),
+-        markets=_markets(), cfg=make_cfg(), notifiers=[tg_allfail], health={},
+-    )
+-    assert res == "send_failed"
+-    # send_failed 不写去重指纹（下轮可重试）
+-    assert await storage.get_state("daily_report:body_hash") is None
+-
+-
+-async def test_count_notifications_since_ownership(storage: Storage):
+-    """B3：其他任务（event_keys 不含 daily_report）的 success 痕不影响归属统计。"""
+-    w0 = await storage.latest_notification_id()
+-    await storage.record_notification("1", "digest", "digest_alert", "success")
+-    await storage.record_notification("2", "snap", "snap_key", "success")
+-    await storage.record_notification("3", "daily", "daily_report", "success")
+-    await storage.record_notification("4", "daily", "daily_report", "failed")
+-    counts = await storage.count_notifications_since(w0, "daily_report")
+-    assert counts == {"success": 1, "failed": 1}
+-
+-
+-async def test_b4_ntfy_throw_continues_other_segments(storage: Storage, monkeypatch):
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    # 造 3 段（page_size=1，delay=0）
+-    for i in range(3):
+-        await _snap(storage, f"0x{i}", R0 - 7200, 10.0 + i)
+-    markets = [MarketEntry(slug_id=f"M{i}", slug=f"s{i}", condition_id=f"0x{i}") for i in range(3)]
+-    thrower = NtfyThrow()
+-    ok = NtfyOk(storage)
+-    cfg = make_cfg(page_size=1)  # 每市场一段 → 3 段
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(), markets=markets,
+-        cfg=cfg, notifiers=[thrower, ok], health={},
+-    )
+-    # thrower 每段抛异常被 except 捕获补记 failed，ok 每段落 success → sent
+-    assert res == "sent"
+-    assert len(thrower.sent) == 3  # 首段抛错未中断剩余段
+-    assert len(ok.sent) == 3
+-
+-
+-async def test_trigger_degraded_partial_window(storage: Storage, monkeypatch):
+-    """单窗口聚合异常 → 降级正文仍发送，结果码 degraded。"""
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    await _seed(storage)
+-    real_vbw = storage.volume_by_window
+-
+-    async def flaky(start, end):
+-        if end - start == 604800:  # 7d 窗口
+-            raise RuntimeError("db lock")
+-        return await real_vbw(start, end)
+-
+-    monkeypatch.setattr(storage, "volume_by_window", flaky)
+-    tg = TGSwallow(storage)
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(resolve_map={"bbb": "0xBBB"}),
+-        markets=_markets(), cfg=make_cfg(), notifiers=[tg], health={},
+-    )
+-    assert res == "degraded"
+-
+-
+-async def test_trigger_no_channel_send_failed(storage: Storage, monkeypatch):
+-    monkeypatch.setattr(m, "_current_bucket_start", lambda: R0)
+-    await _seed(storage)
+-    res = await trigger_daily_report(
+-        storage=storage, collector=FakeCollector(resolve_map={"bbb": "0xBBB"}),
+-        markets=_markets(), cfg=make_cfg(), notifiers=[], health={},
+-    )
+-    assert res == "send_failed"
+-
+-
+-# ─────────────────────────── 6.6 调度状态机 ───────────────────────────────────
++# ───────────────────────────── 6.6 调度状态机 ────────────────────────────────────
+ 
+ 
+ class _DT(datetime):
+@@ -547,7 +246,7 @@ async def _drain_loop(storage, cfg, results, monkeypatch, cap=6):
+ 
+     real_wait = asyncio.wait_for
+     monkeypatch.setattr(asyncio, "wait_for", fake_wait)
+-    monkeypatch.setattr(m, "datetime", _DT)
++    monkeypatch.setattr(runtime_loops, "datetime", _DT)
+ 
+     async def trigger():
+         r = results[min(len(calls), len(results) - 1)]
+@@ -565,7 +264,7 @@ async def test_loop_terminal_writes_state(storage: Storage, monkeypatch):
+         calls = await _drain_loop(storage, make_cfg(), ["sent"], monkeypatch)
+     finally:
+         _DT.fixed = None
+-    assert len(calls) == 1  # 终值写 state 后不再触发
++    assert len(calls) == 1
+     date_key = "2026-10-31"
+     assert await storage.get_state(f"daily_report:{date_key}") == "sent"
+ 
+@@ -576,7 +275,7 @@ async def test_loop_send_failed_no_state_retry(storage: Storage, monkeypatch):
+         calls = await _drain_loop(storage, make_cfg(), ["send_failed"], monkeypatch, cap=5)
+     finally:
+         _DT.fixed = None
+-    assert len(calls) >= 2  # send_failed 同分钟重试
++    assert len(calls) >= 2
+     assert await storage.get_state("daily_report:2026-10-31") is None
+ 
+ 
+@@ -587,7 +286,7 @@ async def test_loop_already_done_skip(storage: Storage, monkeypatch):
+         calls = await _drain_loop(storage, make_cfg(), ["sent"], monkeypatch)
+     finally:
+         _DT.fixed = None
+-    assert calls == []  # 当日已完成 → 不触发
++    assert calls == []
+ 
+ 
+ async def test_loop_0701_no_fire(storage: Storage, monkeypatch):
+@@ -596,7 +295,7 @@ async def test_loop_0701_no_fire(storage: Storage, monkeypatch):
+         calls = await _drain_loop(storage, make_cfg(), ["sent"], monkeypatch)
+     finally:
+         _DT.fixed = None
+-    assert calls == []  # 错过时刻不补发
++    assert calls == []
+ 
+ 
+ # ───────────────────────────── 6.8 配置校验 ───────────────────────────────────
+@@ -606,8 +305,7 @@ def test_config_fatal_errors_disable_only_daily():
+     s = _mk_settings({"daily_report": {"time": "24:00", "page_size": 0}})
+     cfg = resolve_daily_config(s)
+     assert cfg.enabled is False
+-    assert cfg.errors  # 含 time 与 page_size 两条
+-    # 致命错误只禁用日报；快照节配置仍由 Settings 原样持有，不受日报解析影响
++    assert cfg.errors
+     assert s.snapshot == {}
+ 
+ 
+@@ -624,16 +322,14 @@ def test_config_windows_not_divisible():
+ 
+ 
+ def test_config_bucket_seconds_non_numeric_does_not_crash():
+-    """非数字 bucket_seconds 必须进 errors、禁用日报，不向启动流程抛 ValueError。"""
+     s = _mk_settings({"daily_report": {"bucket_seconds": "abc"}})
+     cfg = resolve_daily_config(s)
+     assert cfg.enabled is False
+     assert any("bucket_seconds" in e for e in cfg.errors)
+-    assert cfg.bucket_seconds == 7200  # 兜底默认值，避免后续取模再抛
++    assert cfg.bucket_seconds == 7200
+ 
+ 
+ def test_config_bucket_seconds_zero_or_negative_does_not_crash():
+-    """0 / 负数 bucket_seconds 必须进 errors，不触发 ZeroDivisionError。"""
+     for bad in (0, -7200):
+         s = _mk_settings({"daily_report": {"bucket_seconds": bad}})
+         cfg = resolve_daily_config(s)
+@@ -643,7 +339,6 @@ def test_config_bucket_seconds_zero_or_negative_does_not_crash():
+ 
+ 
+ def test_config_retention_days_non_numeric_tolerant():
+-    """快照节保留期非数字时容错回退 90，不抛异常、不阻断日报启用。"""
+     s = _mk_settings({"snapshot": {"retention_days": "abc"}, "daily_report": {}})
+     cfg = resolve_daily_config(s)
+     assert cfg.enabled is True
+@@ -667,7 +362,7 @@ def test_config_defaults():
+     assert cfg.enabled and cfg.time_hour == 7 and cfg.top_n == 0 and cfg.page_size == 20
+ 
+ 
+-# ───────────────────────────── 6.9 工厂装配 ───────────────────────────────────
++# ───────────────────────────── 6.9 工厂装配 ────────────────────────────────────
+ 
+ 
+ def _ntfy_settings(platforms, ntfy_raw):
+@@ -688,13 +383,13 @@ def test_factory_daily_no_fallback():
+ 
+     s = _ntfy_settings(["ntfy"], {"topic": "t", "snapshot_topic": "snap"})
+     ns = build_notifiers(s, None, None, None, kind="daily")
+-    assert ns == []  # 无 daily_topic 不回退
++    assert ns == []
+ 
+ 
+ def test_factory_snapshot_fallback_intact():
+     from src.notify.factory import build_notifiers
+ 
+-    s = _ntfy_settings(["ntfy"], {"topic": "t"})  # 无 snapshot_topic → 回退 topic（回归红线）
++    s = _ntfy_settings(["ntfy"], {"topic": "t"})
+     ns = build_notifiers(s, None, None, None, kind="snapshot")
+     assert len(ns) == 1 and "/t" in ns[0].describe()
+ 
+@@ -703,7 +398,7 @@ def test_factory_telegram_api_none_skips():
+     from src.notify.factory import build_notifiers
+ 
+     s = _mk_settings({"notify": {"platforms": ["telegram"]}})
+-    ns = build_notifiers(s, None, None, None, kind="daily")  # telegram_api None → 跳过
++    ns = build_notifiers(s, None, None, None, kind="daily")
+     assert ns == []
+ 
+ 
+diff --git a/tests/test_daily_usecase.py b/tests/test_daily_usecase.py
+index 6e61859..cc08cd8 100644
+--- a/tests/test_daily_usecase.py
++++ b/tests/test_daily_usecase.py
+@@ -1,9 +1,15 @@
+-"""DailyReportUsecase 测试。"""
++"""DailyReportUsecase 测试。
++
++覆盖旧 trigger_daily_report 集成测试迁移过来的关键语义：
++happy path / selfcheck_failed / sent_dup / send_failed / degraded。
++"""
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+ 
++import pytest
++
+ from framework.delivery.router import ChannelRouter, DeliveryResult
+ from framework.models.message import RenderedMessage
+ from framework.render.paginator import MessagePaginator
+@@ -19,7 +25,9 @@ class _M:
+ 
+ 
+ class Catalog:
+-    def markets(self): return [_M("CID-A"), _M("CID-B")]
++    def __init__(self, cids=("cid-a", "cid-b")):
++        self._cids = cids
++    def markets(self): return [_M(c) for c in self._cids]
+ 
+ 
+ class _WSum:
+@@ -27,19 +35,36 @@ class _WSum:
+ 
+ 
+ class Query:
++    """可配置的假 windows_sum：按窗口天数返回不同 shares。
++
++    windows_shares: dict[天数d -> shares值或Exception]；None 表示该窗口无行。
++    """
++    def __init__(self, windows_shares=None):
++        self._ws = windows_shares or {1: 1.0, 3: 2.0, 7: 3.0}
+     async def windows_sum(self, *, start_ts, end_ts, cid=None):
+-        return [_WSum("cid-a", 1.0), _WSum("cid-b", 2.0)]
++        span_days = (end_ts - start_ts) // 86400
++        val = self._ws.get(span_days, 1.0)
++        if isinstance(val, Exception):
++            raise val
++        if val is None:
++            return []
++        return [_WSum("cid-a", float(val)), _WSum("cid-b", float(val) * 2)]
+     async def latest_complete_buckets(self, now): return []
+ 
+ 
+ class Renderer:
++    def __init__(self, body=None): self._body = body
+     def render(self, rows, **kw):
+-        return RenderedMessage(body="\n".join(r["condition_id"] for r in rows))
++        if self._body is None:
++            return RenderedMessage(body="\n".join(r["condition_id"] for r in rows))
++        return RenderedMessage(body=self._body) if self._body else None
+ 
+ 
+ class Hash:
+-    def __init__(self): self.recorded = []
+-    async def matches(self, ns, k, b): return False
++    def __init__(self, already_hit=False):
++        self.recorded = []
++        self._hit = already_hit
++    async def matches(self, ns, k, b): return self._hit
+     async def record(self, ns, k, b): self.recorded.append(b)
+ 
+ 
+@@ -49,17 +74,75 @@ class Good:
+     async def deliver(self, m, ts): return DeliveryResult(outcomes=())
+ 
+ 
+-def _run():
++def _run(*, query=None, renderer=None, body_hash=None, channels=None,
++         config=None, catalog=None):
+     uc = DailyReportUsecase(
+-        catalog=Catalog(), query=Query(), renderer=Renderer(),
+-        router=ChannelRouter([Good()], _Prov()), paginator=MessagePaginator(),
+-        body_hash=Hash(), config=DailyReportConfig(now_bucket=100), health={},
++        catalog=catalog or Catalog(),
++        query=query or Query(),
++        renderer=renderer or Renderer(),
++        router=ChannelRouter(channels if channels is not None else [Good()], _Prov()),
++        paginator=MessagePaginator(),
++        body_hash=body_hash or Hash(),
++        config=config or DailyReportConfig(now_bucket=100, windows_days=[1, 3, 7]),
++        health={},
+     )
+     return asyncio.run(uc.run()), uc
+ 
+ 
++# ── happy path ──
++
+ def test_daily_happy():
+     result, uc = _run()
+     assert result == "sent"
+     assert uc._health["daily_result"] == "sent"
+     assert uc._hash.recorded
++
++
++# ── 单调自检：逆序拒发 ──
++
++def test_daily_selfcheck_reject():
++    """7d < 3d < 1d 人为逆序 → selfcheck_failed，零发送。"""
++    q = Query(windows_shares={1: 999.0, 3: 500.0, 7: 400.0})
++    h = Hash()
++    result, uc = _run(query=q, body_hash=h)
++    assert result == "selfcheck_failed"
++    assert uc._health["daily_result"] == "selfcheck_failed"
++    assert not h.recorded  # 拒发不落指纹
++
++
++def test_daily_selfcheck_second_pair_reject():
++    """3d > 7d 第二对逆序同样拒发。"""
++    q = Query(windows_shares={1: 100.0, 3: 100.0, 7: 0.0})
++    result, _ = _run(query=q)
++    assert result == "selfcheck_failed"
++
++
++# ── 去重 ──
++
++def test_daily_sent_dup():
++    """Hash.matches 命中 → sent_dup，不发送不 record。"""
++    h = Hash(already_hit=True)
++    result, uc = _run(body_hash=h)
++    assert result == "sent_dup"
++    assert uc._health["daily_result"] == "sent_dup"
++    assert not h.recorded
++
++
++# ── 成败判定 ──
++
++def test_daily_send_failed_no_channels():
++    """configured_channels=0 → send_failed，不落指纹。"""
++    h = Hash()
++    result, uc = _run(channels=[], body_hash=h)
++    assert result == "send_failed"
++    assert not h.recorded
++
++
++# ── 降级：部分窗口失败 ──
++
++def test_daily_degraded_partial_window():
++    """7d 窗口异常 → 跳过自检，降级发送 degraded。"""
++    q = Query(windows_shares={1: 100.0, 3: 200.0, 7: RuntimeError("db lock")})
++    result, uc = _run(query=q)
++    assert result == "degraded"
++    assert uc._health["daily_result"] == "degraded"

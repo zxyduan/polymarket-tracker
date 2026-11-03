@@ -1,0 +1,146 @@
+From 8bd2fef1b440aa03a94eacc7750f8e3f109b36b0 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:01:54 +0800
+Subject: [PATCH] feat(p1): add WindowSum DTO + SnapshotStore.windows_sum port
+ (T02/T03)
+
+---
+ framework/models/snapshot.py      | 17 +++++++++++
+ framework/store/snapshot_store.py | 45 +++++++++++++++++++++++++++++
+ tests/test_snapshot_store.py      | 48 +++++++++++++++++++++++++++++++
+ 3 files changed, 110 insertions(+)
+ create mode 100644 framework/models/snapshot.py
+ create mode 100644 framework/store/snapshot_store.py
+ create mode 100644 tests/test_snapshot_store.py
+
+diff --git a/framework/models/snapshot.py b/framework/models/snapshot.py
+new file mode 100644
+index 0000000..b20e689
+--- /dev/null
++++ b/framework/models/snapshot.py
+@@ -0,0 +1,17 @@
++"""快照行/聚合 DTO（设计 v3.5 §3.2）。
++
++边界只传 DTO，禁止 dict[str, Any] 穿过 L1/L2/L3。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class WindowSum:
++    condition_id: str
++    slug: str
++    slug_id: str
++    shares: float          # SUM(volume_shares >= 0)，-1/缺失贡献 0
++    buckets: int           # 命中行数，仅诊断
+diff --git a/framework/store/snapshot_store.py b/framework/store/snapshot_store.py
+new file mode 100644
+index 0000000..5859cee
+--- /dev/null
++++ b/framework/store/snapshot_store.py
+@@ -0,0 +1,45 @@
++"""SnapshotStore（设计 v3.5 §3.2/§3.3，T02/T03）。
++
++windows_sum 的 SQL 逐字平移旧 volume_by_window；cid 为新增能力。
++禁止在 store 内用 time.time()，窗口由调用方传入。
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++from framework.models.snapshot import WindowSum
++
++if TYPE_CHECKING:
++    from src.storage import Storage
++
++
++class SnapshotStore:
++    def __init__(self, storage: "Storage") -> None:
++        self._storage = storage
++
++    async def windows_sum(
++        self, *, start_ts: int, end_ts: int, cid: str | None = None
++    ) -> list[WindowSum]:
++        sql = [
++            "SELECT condition_id, MAX(slug) AS slug, MAX(slug_id) AS slug_id,",
++            "SUM(CASE WHEN volume_shares >= 0 THEN volume_shares ELSE 0 END) AS shares,",
++            "COUNT(*) AS buckets",
++            "FROM market_snapshots WHERE bucket_ts >= ? AND bucket_ts < ?",
++        ]
++        params: list[Any] = [start_ts, end_ts]
++        if cid is not None:
++            sql.append("AND condition_id = ?")
++            params.append(cid.lower())
++        sql.append("GROUP BY condition_id")
++        rows = await self._storage._fetchall(" ".join(sql), tuple(params))
++        return [
++            WindowSum(
++                condition_id=row["condition_id"],
++                slug=row["slug"] or "",
++                slug_id=row["slug_id"] or "",
++                shares=row["shares"] or 0.0,
++                buckets=row["buckets"] or 0,
++            )
++            for row in rows
++        ]
+diff --git a/tests/test_snapshot_store.py b/tests/test_snapshot_store.py
+new file mode 100644
+index 0000000..eb88eeb
+--- /dev/null
++++ b/tests/test_snapshot_store.py
+@@ -0,0 +1,48 @@
++"""SnapshotStore.windows_sum 测试（T02/T03）。"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from src.storage import Storage
++from framework.store.snapshot_store import SnapshotStore
++
++
++async def _insert_row(storage, *, cid, ts, shares, slug=""):
++    await storage._execute(
++        "INSERT INTO market_snapshots "
++        "(condition_id, slug, slug_id, bucket_ts, price_open, price_close, "
++        " price_high, price_low, volume_shares, collected_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
++        (cid, slug, "", ts, 1.0, 1.0, 1.0, 1.0, shares, ts),
++    )
++
++
++@pytest.fixture
++async def storage(tmp_path: Path) -> Storage:
++    db = Storage(str(tmp_path / "test.db"))
++    await db.init()
++    return db
++
++
++async def test_windows_sum_basic_and_cid_filter(storage):
++    s = SnapshotStore(storage)
++    B = 1_000_000
++    await _insert_row(storage, cid="aaa", ts=B, shares=1.5)
++    await _insert_row(storage, cid="aaa", ts=B + 60, shares=-1.0)   # 未知桶贡献 0
++    await _insert_row(storage, cid="bbb", ts=B, shares=2.5)
++    await _insert_row(storage, cid="ccc", ts=B - 10_000, shares=9.9)  # 窗口外
++
++    rows = await s.windows_sum(start_ts=B - 1, end_ts=B + 3600)
++    by = {r.condition_id: r for r in rows}
++    assert set(by) == {"aaa", "bbb"}
++    assert by["aaa"].shares == 1.5 and by["aaa"].buckets == 2
++    assert by["bbb"].shares == 2.5
++
++    only_aaa = await s.windows_sum(start_ts=B - 1, end_ts=B + 3600, cid="aaa")
++    assert [r.condition_id for r in only_aaa] == ["aaa"]
++
++    # 开闭区间边界：end_ts 上界不包含
++    empty = await s.windows_sum(start_ts=B, end_ts=B)
++    assert empty == []
+-- 
+2.34.1
+

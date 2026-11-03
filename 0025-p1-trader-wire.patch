@@ -1,0 +1,97 @@
+From 2ffb96d8116c630ec37784e10c056b8bc04b5030 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 13:06:44 +0800
+Subject: [PATCH] feat(p1): wire trader queue consumer to TraderAlertUsecase
+
+---
+ features/trader/renderer.py | 16 ++++++++++++++++
+ src/main.py                 | 24 +++++++++++++++++++++---
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+ create mode 100644 features/trader/renderer.py
+
+diff --git a/features/trader/renderer.py b/features/trader/renderer.py
+new file mode 100644
+index 0000000..007e052
+--- /dev/null
++++ b/features/trader/renderer.py
+@@ -0,0 +1,16 @@
++"""F1 交易员渲染适配层。"""
++
++from __future__ import annotations
++
++from framework.models.message import RenderedMessage
++
++
++class LegacyTraderRenderer:
++    def render(self, event):
++        return RenderedMessage(
++            body=event.html,
++            body_format="html",
++            title=getattr(event, "title", ""),
++            event_keys=tuple(getattr(event, "event_keys", [])),
++            buttons=getattr(event, "buttons", []),
++        )
+diff --git a/src/main.py b/src/main.py
+index 131277e..67c18f0 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -653,6 +653,23 @@ async def amain(config_path: str) -> None:
+     # 快照推送通道列表（见下方装配；可 telegram + ntfy 同时启用）
+     snap_notifiers: list[Notifier] = []
+     _p1_snap_uc = None  # P1 usecase 装配后替换
++    _p1_trader_uc = None
++
++    async def _trader_consumer(queue, stop):
++        while not stop.is_set():
++            alert = await queue.get()
++            try:
++                if _p1_trader_uc is not None:
++                    await _p1_trader_uc.handle(alert)
++                else:
++                    for n in trader_notifiers:
++                        try:
++                            await n.send(alert.html, buttons=alert.buttons,
++                                         event_keys=alert.event_keys)
++                        except Exception as exc:
++                            logger.error("推送失败(%s): %s", n.describe(), exc)
++            finally:
++                queue.task_done()
+ 
+     # 日报通道与状态（延迟装配，模式对齐 snap_notifiers；闭包调用时才读取列表内容）
+     daily_notifiers: list[Notifier] = []
+@@ -847,7 +864,7 @@ async def amain(config_path: str) -> None:
+             asyncio.create_task(
+                 supervised(
+                     "bot_sender",
+-                    lambda: run_sender(trader_notifiers, message_queue, stop_event),
++                    lambda: _trader_consumer(message_queue, stop_event),
+                     stop_event,
+                 )
+             )
+@@ -1044,6 +1061,7 @@ async def amain(config_path: str) -> None:
+             logger.info("P1 日报 usecase 已接管")
+ 
+             from features.trader.usecase import TraderAlertUsecase, TraderConfig
++            from features.trader.renderer import LegacyTraderRenderer
+             from framework.adapters.notifier_channel import NotifierChannel as _NC
+ 
+             trader_router = ChannelRouter(
+@@ -1051,13 +1069,13 @@ async def amain(config_path: str) -> None:
+                 type("_P", (), {"targets": staticmethod(lambda: [])})(),
+             )
+             _p1_trader_uc = TraderAlertUsecase(
+-                renderer=None,  # TODO: AlertRenderer 适配层待写
++                renderer=LegacyTraderRenderer(),
+                 router=trader_router,
+                 guard=None,
+                 config=TraderConfig(),
+                 health={},
+             )
+-            logger.info("P1 trader usecase 已构造（未接管队列）")
++            logger.info("P1 trader usecase 已接管队列")
+     except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
+         logger.exception("P1 bootstrap 装配失败，回退旧链路")
+ 
+-- 
+2.34.1
+

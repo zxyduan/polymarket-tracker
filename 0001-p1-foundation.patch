@@ -1,0 +1,190 @@
+From ab9963cd8319cc1117deafc2362c2c3e419d0fb9 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 11:43:08 +0800
+Subject: [PATCH] =?UTF-8?q?feat(p1):=20scaffold=20framework/=20=E2=80=94?=
+ =?UTF-8?q?=20RenderedMessage/DeliveryTarget/ChannelRouter=20per=20design?=
+ =?UTF-8?q?=20v3.5=20=C2=A77.1/=C2=A77.3/=C2=A77.4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ framework/__init__.py          |  0
+ framework/delivery/__init__.py |  0
+ framework/delivery/router.py   | 87 ++++++++++++++++++++++++++++++++++
+ framework/delivery/targets.py  | 26 ++++++++++
+ framework/models/__init__.py   |  0
+ framework/models/message.py    | 22 +++++++++
+ 6 files changed, 135 insertions(+)
+ create mode 100644 framework/__init__.py
+ create mode 100644 framework/delivery/__init__.py
+ create mode 100644 framework/delivery/router.py
+ create mode 100644 framework/delivery/targets.py
+ create mode 100644 framework/models/__init__.py
+ create mode 100644 framework/models/message.py
+
+diff --git a/framework/__init__.py b/framework/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/delivery/__init__.py b/framework/delivery/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/delivery/router.py b/framework/delivery/router.py
+new file mode 100644
+index 0000000..b370ae7
+--- /dev/null
++++ b/framework/delivery/router.py
+@@ -0,0 +1,87 @@
++"""逐目标结果与逐通道隔离路由（设计 v3.5 §7.4，S-02/T-01/T-02/N-04）。
++
++作用域（N-04）：每个 feature 独立构造一个 ChannelRouter（F1/F2/F3 三套），
++self._channels 与 self._provider 只含本 feature 的通道；
++dispatch(feature, msg) 的 feature 参数只用于落痕归属与日志，不承担跨 feature 路由；
++禁止用一个全局 router 混投。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Literal, Protocol, Sequence, runtime_checkable
++
++from framework.models.message import RenderedMessage
++from framework.delivery.targets import DeliveryTarget
++
++
++@dataclass(frozen=True)
++class TargetOutcome:
++    target: DeliveryTarget
++    status: Literal["success", "failed"]
++    error: str | None = None
++    error_kind: Literal["target", "channel"] = "target"
++
++
++@dataclass(frozen=True)
++class ChannelFailure:
++    channel: str                 # 通道名，如 "ntfy"
++    error: str
++    reference: str = ""           # 通道自述，如 "ntfy@https://..."（T-02）
++
++
++@dataclass(frozen=True)
++class DeliveryResult:
++    outcomes: tuple[TargetOutcome, ...]
++    channel_failures: tuple[ChannelFailure, ...] = ()
++    configured_channels: int = 0  # 构造时的通道数，与 targets 是否存在无关（T-01）
++
++
++@runtime_checkable
++class Channel(Protocol):
++    name: str
++
++    def describe(self) -> str:
++        """Telegram: "telegram@{N} chats"；ntfy: "ntfy@{url}"（T-02）。"""
++        ...
++
++    async def deliver(
++        self, msg: RenderedMessage, targets: Sequence[DeliveryTarget]
++    ) -> DeliveryResult:
++        ...
++
++
++class RecipientProvider(Protocol):
++    def targets(self) -> list[DeliveryTarget]:
++        ...
++
++
++class ChannelRouter:
++    """按 feature 构造；逐通道 catch 后继续，不抛异常（S-02b）。"""
++
++    def __init__(self, channels: Sequence[Channel], provider: RecipientProvider) -> None:
++        self._channels = tuple(channels)
++        self._provider = provider
++
++    async def dispatch(self, feature: str, msg: RenderedMessage) -> DeliveryResult:
++        outcomes: list[TargetOutcome] = []
++        failures: list[ChannelFailure] = []
++        for channel in self._channels:
++            targets = [t for t in self._provider.targets() if t.channel == channel.name]
++            if not targets:
++                continue
++            try:
++                result = await channel.deliver(msg, targets)
++                outcomes.extend(result.outcomes)
++                failures.extend(result.channel_failures)
++            except Exception as exc:  # 单通道异常不阻断其他通道
++                failures.append(ChannelFailure(
++                    channel=channel.name,
++                    error=str(exc),
++                    reference=channel.describe(),   # T-02
++                ))
++        return DeliveryResult(
++            outcomes=tuple(outcomes),
++            channel_failures=tuple(failures),
++            configured_channels=len(self._channels),  # T-01
++        )
+diff --git a/framework/delivery/targets.py b/framework/delivery/targets.py
+new file mode 100644
+index 0000000..69681b9
+--- /dev/null
++++ b/framework/delivery/targets.py
+@@ -0,0 +1,26 @@
++"""投递目标泛化（设计 v3.5 §7.3）。
++
++targets.py 是全项目唯一定义点；新增通道不必修改联合类型。
++RecipientProvider.targets() 返回 list[DeliveryTarget]，
++各通道按 target.channel 过滤；用构造器与测试约束，不用 isinstance 分支。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Mapping
++
++
++@dataclass(frozen=True)
++class DeliveryTarget:
++    channel: str                 # "telegram" / "ntfy" / future
++    address: str                 # chat_id / topic / webhook URL
++    options: Mapping[str, str] = field(default_factory=dict)
++
++
++def telegram_chat(chat_id: str) -> DeliveryTarget:
++    return DeliveryTarget(channel="telegram", address=chat_id)
++
++
++def ntfy_topic(name: str) -> DeliveryTarget:
++    return DeliveryTarget(channel="ntfy", address=name)
+diff --git a/framework/models/__init__.py b/framework/models/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/models/message.py b/framework/models/message.py
+new file mode 100644
+index 0000000..806f8d2
+--- /dev/null
++++ b/framework/models/message.py
+@@ -0,0 +1,22 @@
++"""L2 消息 DTO（设计 v3.5 §7.1）。
++
++边界纪律：边界只传 DTO，禁止 dict[str, Any] 穿过 L1/L2/L3；
++消息与通道解耦——消息带 body_format，通道决定如何发送，
++不在消息模型里假定 Telegram HTML。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Literal, Mapping
++
++BodyFormat = Literal["html", "text"]
++
++
++@dataclass(frozen=True)
++class RenderedMessage:
++    body: str
++    body_format: BodyFormat = "html"
++    title: str = ""
++    event_keys: tuple[str, ...] = ()
++    buttons: tuple[Mapping[str, Any], ...] = ()
+-- 
+2.34.1
+

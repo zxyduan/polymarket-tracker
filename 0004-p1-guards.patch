@@ -1,0 +1,152 @@
+From ae7254a3de5d03c43c594ace91147a58b7d1834c Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 11:59:12 +0800
+Subject: [PATCH] feat(p1): add BodyHashGuard + FireOnceGuard(no body_hash) +
+ CursorStore port (T08)
+
+---
+ framework/models/ports.py       | 18 +++++++++++++
+ framework/scheduler/__init__.py |  0
+ framework/scheduler/guard.py    | 47 +++++++++++++++++++++++++++++++++
+ tests/test_guard.py             | 46 ++++++++++++++++++++++++++++++++
+ 4 files changed, 111 insertions(+)
+ create mode 100644 framework/models/ports.py
+ create mode 100644 framework/scheduler/__init__.py
+ create mode 100644 framework/scheduler/guard.py
+ create mode 100644 tests/test_guard.py
+
+diff --git a/framework/models/ports.py b/framework/models/ports.py
+new file mode 100644
+index 0000000..91fc966
+--- /dev/null
++++ b/framework/models/ports.py
+@@ -0,0 +1,18 @@
++"""models 层端口协议（设计 v3.5 §4.1 / §8.3）。
++
++只定义协议，不定义实现；scheduler/guard/usecase 只依赖这里，
++不得 import src.storage 等 L3 实现（09 §1.2 分层矩阵）。
++"""
++
++from __future__ import annotations
++
++from typing import Protocol, runtime_checkable
++
++
++@runtime_checkable
++class CursorStore(Protocol):
++    """StateStore 结构化实现需满足的协议（T01）。"""
++
++    async def get(self, namespace: str, key: str) -> str | None: ...
++
++    async def set(self, namespace: str, key: str, value: str) -> None: ...
+diff --git a/framework/scheduler/__init__.py b/framework/scheduler/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/scheduler/guard.py b/framework/scheduler/guard.py
+new file mode 100644
+index 0000000..18f7d25
+--- /dev/null
++++ b/framework/scheduler/guard.py
+@@ -0,0 +1,47 @@
++"""调度守卫（设计 v3.5 §8，关闭 F08）。
++
++- FireOnceGuard：纯配置 frozen 数据类，只描述节奏；已删 body_hash 字段。
++  取值只在 09 §3.4.1 定义，本文件不复制常量表。
++- BodyHashGuard：用例级正文指纹去重，只依赖 CursorStore 协议，
++  不 import L3 实现；matches 只读、record 只写、仅发送成功才 record。
++"""
++
++from __future__ import annotations
++
++import hashlib
++from dataclasses import dataclass
++from enum import Enum
++
++from framework.models.ports import CursorStore
++
++
++class CommitCondition(str, Enum):
++    RETURN_OK = "return_ok"
++    FINAL_CODE_IN = "final_code_in"
++
++
++@dataclass(frozen=True)
++class FireOnceGuard:
++    commit_when: CommitCondition
++    commit_state_on: frozenset[str]
++    retry_poll_seconds: int      # 命中分钟内未落 state 的轮询
++    cooldown_seconds: int        # 已落 state 后的冷却
++
++
++class BodyHashGuard:
++    def __init__(self, states: CursorStore) -> None:
++        self._states = states
++
++    @staticmethod
++    def _fingerprint(body: str) -> str:
++        # 与现状逐字一致：sha1(body.encode())
++        return hashlib.sha1(body.encode()).hexdigest()
++
++    async def matches(self, namespace: str, key: str, body: str) -> bool:
++        """正文指纹与已存记录一致即命中（重复），命中则跳过发送。只读。"""
++        old = await self._states.get(namespace, key)
++        return old is not None and old == self._fingerprint(body)
++
++    async def record(self, namespace: str, key: str, body: str) -> None:
++        """仅发送成功后调用。"""
++        await self._states.set(namespace, key, self._fingerprint(body))
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+new file mode 100644
+index 0000000..d3536e9
+--- /dev/null
++++ b/tests/test_guard.py
+@@ -0,0 +1,46 @@
++"""守卫测试（T08）。"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from src.storage import Storage
++from framework.models.ports import CursorStore
++from framework.scheduler.guard import BodyHashGuard, FireOnceGuard, CommitCondition
++from framework.store.state_store import StateStore
++
++
++@pytest.fixture
++async def storage(tmp_path: Path) -> Storage:
++    db = Storage(str(tmp_path / "test.db"))
++    await db.init()
++    return db
++
++
++@pytest.fixture
++async def states(storage) -> StateStore:
++    return StateStore(storage)
++
++
++def test_state_store_satisfies_cursorstore_protocol(states):
++    assert isinstance(states, CursorStore)
++
++
++async def test_bodyhash_guard_dedup(states):
++    g = BodyHashGuard(states)
++    assert not await g.matches("snapshot", "push:d:label", "body-A")
++    await g.record("snapshot", "push:d:label", "body-A")
++    assert await g.matches("snapshot", "push:d:label", "body-A")       # 相同正文命中
++    assert not await g.matches("snapshot", "push:d:label", "body-B")  # 不同正文不命中
++
++
++def test_fireonce_guard_has_no_bodyhash():
++    g = FireOnceGuard(
++        commit_when=CommitCondition.RETURN_OK,
++        commit_state_on=frozenset({"ok"}),
++        retry_poll_seconds=30,
++        cooldown_seconds=60,
++    )
++    assert not hasattr(g, "body_hash")
+-- 
+2.34.1
+

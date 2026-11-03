@@ -1,0 +1,54 @@
+From 325393672ba009e0b34f62c5b49ff09aef636531 Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 14:18:39 +0800
+Subject: [PATCH] test(p5): T18/T19 send_failed and channel trace semantics
+
+---
+ tests/test_p5_semantics.py | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+ create mode 100644 tests/test_p5_semantics.py
+
+diff --git a/tests/test_p5_semantics.py b/tests/test_p5_semantics.py
+new file mode 100644
+index 0000000..5f54dbb
+--- /dev/null
++++ b/tests/test_p5_semantics.py
+@@ -0,0 +1,35 @@
++"""P5: T16/T18/T19 验收测试。"""
++
++import pytest
++
++from framework.models.message import RenderedMessage
++from framework.delivery.router import ChannelRouter, DeliveryResult, ChannelFailure
++
++
++class _Prov:
++    def targets(self):
++        from framework.delivery.targets import DeliveryTarget
++        return [DeliveryTarget(channel="fail", address="1")]
++
++
++class _FailChan:
++    name = "fail"
++    def describe(self): return "fail-chan"
++    async def deliver(self, m, ts): raise RuntimeError("boom")
++
++
++# T18: F2 send_failed 语义 → channel_failures 非空
++@pytest.mark.asyncio
++async def test_t18_send_failed():
++    r = ChannelRouter([_FailChan()], _Prov())
++    res = await r.dispatch("f2", RenderedMessage(body="x"))
++    assert res.configured_channels == 1
++    assert len(res.channel_failures) == 1
++
++
++# T19: F3 channel 落痕 → reference 记录
++@pytest.mark.asyncio
++async def test_t19_channel_trace():
++    r = ChannelRouter([_FailChan()], _Prov())
++    res = await r.dispatch("f3", RenderedMessage(body="x"))
++    assert res.channel_failures[0].reference == "fail-chan"
+-- 
+2.34.1
+

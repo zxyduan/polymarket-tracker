@@ -1,0 +1,125 @@
+From e359e0fc8d504405d445fe81957b59cc8d2ba59d Mon Sep 17 00:00:00 2001
+From: zxyduan <944781538@qq.com>
+Date: Tue, 3 Nov 2026 12:20:01 +0800
+Subject: [PATCH] =?UTF-8?q?feat(p1):=20add=20MessagePaginator=20+=20Length?=
+ =?UTF-8?q?Policy=20(=C2=A77.2,=20F3)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ framework/render/__init__.py  |  0
+ framework/render/paginator.py | 54 +++++++++++++++++++++++++++++++++++
+ tests/test_paginator.py       | 35 +++++++++++++++++++++++
+ 3 files changed, 89 insertions(+)
+ create mode 100644 framework/render/__init__.py
+ create mode 100644 framework/render/paginator.py
+ create mode 100644 tests/test_paginator.py
+
+diff --git a/framework/render/__init__.py b/framework/render/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/framework/render/paginator.py b/framework/render/paginator.py
+new file mode 100644
+index 0000000..417eed7
+--- /dev/null
++++ b/framework/render/paginator.py
+@@ -0,0 +1,54 @@
++"""MessagePaginator（设计 v3.5 §7.2，F3 专用）。
++
++切分 RenderedMessage.body，保留 body_format/event_keys；
++title 首段沿用、续段追加"（续 i/n）"。长度口径逐字平移 main.py 的
++_daily_oversize/_fit_daily_chunk：4096 字符与 4096 字节双上限。
++F1/F2 不实例化本类。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from framework.models.message import RenderedMessage
++
++
++@dataclass(frozen=True)
++class LengthPolicy:
++    max_chars: int = 4096
++    max_bytes: int = 4096
++
++
++class MessagePaginator:
++    def __init__(self, policy: LengthPolicy | None = None) -> None:
++        self._policy = policy or LengthPolicy()
++
++    def _oversize(self, text: str) -> bool:
++        p = self._policy
++        return len(text) > p.max_chars or len(text.encode("utf-8")) > p.max_bytes
++
++    def _fit(self, lines: list[str], title: str) -> list[list[str]]:
++        if not lines:
++            return [lines]
++        probe = "\n".join([title, *lines])
++        if not self._oversize(probe) or len(lines) == 1:
++            return [lines]
++        mid = max(1, len(lines) // 2)
++        return self._fit(lines[:mid], title) + self._fit(lines[mid:], title)
++
++    def paginate(self, msg: RenderedMessage) -> list[RenderedMessage]:
++        lines = msg.body.split("\n") if msg.body else []
++        fitted = self._fit(lines, msg.title)
++        total = len(fitted)
++        out: list[RenderedMessage] = []
++        for i, chunk in enumerate(fitted, 1):
++            head = msg.title if i == 1 else f"{msg.title}（续 {i}/{total}）"
++            body = "\n".join([head, *chunk])
++            out.append(RenderedMessage(
++                body=body,
++                body_format=msg.body_format,
++                title=msg.title,
++                event_keys=msg.event_keys,
++                buttons=msg.buttons,
++            ))
++        return out
+diff --git a/tests/test_paginator.py b/tests/test_paginator.py
+new file mode 100644
+index 0000000..273d176
+--- /dev/null
++++ b/tests/test_paginator.py
+@@ -0,0 +1,35 @@
++"""MessagePaginator 测试（§7.2 边界 4095/4096/4097）。"""
++
++from framework.models.message import RenderedMessage
++from framework.render.paginator import LengthPolicy, MessagePaginator
++
++
++def test_under_limit_single_page():
++    p = MessagePaginator()
++    msg = RenderedMessage(body="line1\nline2", body_format="text",
++                          title="日报", event_keys=("daily_report",))
++    out = p.paginate(msg)
++    assert len(out) == 1
++    assert out[0].event_keys == ("daily_report",)
++    assert out[0].body_format == "text"
++
++
++def test_boundary_4095_4096_single_4097_splits():
++    p = MessagePaginator(LengthPolicy(max_chars=4096, max_bytes=4096))
++    under = "x" * 4095
++    assert len(p.paginate(RenderedMessage(body=under))) == 1
++
++    at = "x" * 4096
++    assert len(p.paginate(RenderedMessage(body=at))) == 1
++
++    over = "x" * 4097 + "\nline2"
++    out = p.paginate(RenderedMessage(body=over))
++    assert len(out) >= 2
++
++
++def test_continuation_title():
++    p = MessagePaginator(LengthPolicy(max_chars=20))
++    body = "\n".join(["a" * 15, "b" * 15, "c" * 15])
++    out = p.paginate(RenderedMessage(body=body, title="日报"))
++    assert out[0].body.startswith("日报\n")
++    assert any("（续" in o.body for o in out)
+-- 
+2.34.1
+
