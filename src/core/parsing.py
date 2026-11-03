@@ -23,7 +23,7 @@ from src.core.models import (
 )
 
 # 各类字段候选键
-_WALLET_KEYS = ("proxyWallet", "wallet", "walletAddress", "maker", "makerAddress", "user")
+_WALLET_KEYS = ("proxyWallet", "proxy_wallet", "wallet", "walletAddress", "maker", "makerAddress", "user")
 _TX_KEYS = ("txHash", "transactionHash", "tx_hash", "hash", "transaction_hash")
 _LOG_KEYS = ("logIndex", "log_index")
 _TIME_KEYS = ("timestamp", "time", "blockTime", "createdAt", "matchedAt")

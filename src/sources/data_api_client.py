@@ -157,7 +157,7 @@ class DataApiClient:
         if cursor:
             params["cursor"] = cursor
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(f"{self.base_url}/activity", params=params)
+            response = await client.get(f"{self.base_url}/v2/trades", params=params)
             response.raise_for_status()
             return _extract_items(response.json())
 
