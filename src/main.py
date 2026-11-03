@@ -964,6 +964,27 @@ async def amain(config_path: str) -> None:
 
     loop = asyncio.get_running_loop()
 
+    # ── P1 新骨架装配（双轨：默认不接管，env P1_SWITCH=1 时启用）──
+    try:
+        import os
+        from framework.bootstrap import build_runtime
+        p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
+        p1_runtime = build_runtime(
+            storage=storage,
+            channels=[],
+            provider=type("_P", (), {"targets": staticmethod(lambda: [])})(),
+            health={},
+            collector=snap_collector,
+            catalog=None,
+            switch=p1_switch,
+        )
+        if p1_switch:
+            logger.info("P1 新骨架已启用（%d features）", len(p1_runtime.modules))
+        else:
+            logger.info("P1 新骨架已装配（默认未接管，P1_SWITCH=1 启用）")
+    except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
+        logger.exception("P1 bootstrap 装配失败，回退旧链路")
+
     def _on_stop() -> None:
         logger.info("收到停止信号，准备退出")
         stop_event.set()
