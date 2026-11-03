@@ -1,0 +1,11 @@
+# VolumeTracker:
+src/snapshots/volume_tracker.py:27:class VolumeTracker:
+src/snapshots/collector.py:10:主来源改为 RTDS activity 全量成交记账（VolumeTracker），无需认证、
+# BotRunner.run_sender:
+src/bot/telegram.py:17:async def run_sender(
+src/bot/telegram.py:109:    async def run_sender(
+src/core/digest.py:124:    逐笔告警相同的 out_queue，由现有 run_sender 走全部通道。
+src/main.py:19:from src.bot.telegram import BotRunner, TelegramApi, run_sender
+src/main.py:826:    # 交易员告警队列经 run_sender 依次投递到全部通道；
+src/main.py:841:                    lambda: run_sender(trader_notifiers, message_queue, stop_event),
+# 模块级 run_sender:
