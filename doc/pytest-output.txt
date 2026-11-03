@@ -4,4 +4,4 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
   warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
 ........................................................................ [ 50%]
 .......................................................................  [100%]
-143 passed in 6.03s
+143 passed in 5.72s

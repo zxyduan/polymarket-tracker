@@ -1,6 +1,6 @@
 # baseline-files.txt（wc -l 口径；末行无换行符可能差 1 行）
-# 机器: ip-172-31-6-169.ap-east-1.compute.internal  日期: 2026-11-03T03:22:41+00:00
-# OS: Linux ip-172-31-6-169.ap-east-1.compute.internal 6.18.44-99.149.amzn2023.x86_64 #2 SMP PREEMPT_DYNAMIC Tue Aug 25 21:16:03 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+# 机器: ip-172-31-6-169.ap-east-1.compute.internal  日期: 2026-11-03T03:38:43+00:00
+# HEAD: 6b339179cfb0c59631c6fdab704a9f73bf1012e1
      3 src/__init__.py
      1 src/bot/__init__.py
     56 src/bot/auth.py
