@@ -1002,80 +1002,44 @@ async def amain(config_path: str) -> None:
         from framework.delivery.router import ChannelRouter
         from framework.render.paginator import MessagePaginator
         from framework.models.message import RenderedMessage
-        from features.market_snapshot.usecase import (
-            SnapshotPushConfig, SnapshotPushUsecase,
-        )
-
         p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
-        p1_channels = [NotifierChannel(n) for n in snap_notifiers]
-
-        from features.market_snapshot.renderer import LegacySnapshotRenderer
-        from features.daily_report.renderer import LegacyDailyRenderer
-        from features.daily_report.usecase import (
-            DailyReportConfig, DailyReportUsecase,
-        )
-
-        class _Catalog:
-            def slugs(self): return [m.slug for m in markets]
-
         if p1_switch:
-            cursor = StateStore(storage)
-            router = ChannelRouter(p1_channels, type("_P", (), {"targets": staticmethod(lambda: [])})())
-            guard = BodyHashGuard(cursor)
-            _p1_snap_uc = SnapshotPushUsecase(
-                catalog=_Catalog(),
-                collector=LegacyCollectorAdapter(snap_collector),
-                query=SnapshotStore(storage),
-                renderer=LegacySnapshotRenderer(
+            from framework.bootstrap import build_runtime
+            from features.market_snapshot.renderer import LegacySnapshotRenderer
+            from features.daily_report.renderer import LegacyDailyRenderer
+            from features.trader.renderer import LegacyTraderRenderer
+            from features.market_snapshot.usecase import SnapshotPushConfig
+            from features.daily_report.usecase import DailyReportConfig
+
+            class _Catalog:
+                def slugs(self): return [m.slug for m in markets]
+
+            _rt, _trader_uc = build_runtime(
+                storage=storage, collector=snap_collector, catalog=_Catalog(),
+                snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
+                trader_notifiers=trader_notifiers,
+                snap_renderer=LegacySnapshotRenderer(
                     tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
                     bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
                 ),
-                router=router,
-                body_hash=guard,
-                config=SnapshotPushConfig(dedup=bool(snapshot_push_cfg.get("dedup", True)),
-                                         now_bucket=_current_bucket_start()),
-                health=snap_health,
-            )
-            logger.info("P1 快照 usecase 已接管推送")
-
-            daily_router = ChannelRouter(
-                [NotifierChannel(n) for n in daily_notifiers],
-                type("_P", (), {"targets": staticmethod(lambda: [])})(),
-            )
-            _p1_daily_uc = DailyReportUsecase(
-                catalog=_Catalog(),
-                query=SnapshotStore(storage),
-                renderer=LegacyDailyRenderer(),
-                router=daily_router,
-                paginator=MessagePaginator(),
-                body_hash=guard,
-                config=DailyReportConfig(
-                    windows_days=list(daily_cfg.windows_days),
-                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
-                    top_n=daily_cfg.top_n,
-                    page_size=daily_cfg.page_size,
+                daily_renderer=LegacyDailyRenderer(),
+                trader_renderer=LegacyTraderRenderer(),
+                snap_cfg=SnapshotPushConfig(
+                    dedup=bool(snapshot_push_cfg.get("dedup", True)),
                     now_bucket=_current_bucket_start(),
                 ),
-                health=daily_health,
+                daily_cfg=DailyReportConfig(
+                    windows_days=list(daily_cfg.windows_days),
+                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
+                    top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
+                    now_bucket=_current_bucket_start(),
+                ),
+                snap_health=snap_health, daily_health=daily_health,
             )
-            logger.info("P1 日报 usecase 已接管")
-
-            from features.trader.usecase import TraderAlertUsecase, TraderConfig
-            from features.trader.renderer import LegacyTraderRenderer
-            from framework.adapters.notifier_channel import NotifierChannel as _NC
-
-            trader_router = ChannelRouter(
-                [_NC(n) for n in trader_notifiers],
-                type("_P", (), {"targets": staticmethod(lambda: [])})(),
-            )
-            _p1_trader_uc = TraderAlertUsecase(
-                renderer=LegacyTraderRenderer(),
-                router=trader_router,
-                guard=None,
-                config=TraderConfig(),
-                health={},
-            )
-            logger.info("P1 trader usecase 已接管队列")
+            _p1_snap_uc = next(m.run for m in _rt.modules if m.name == "market_snapshot")
+            _p1_daily_uc = next(m.run for m in _rt.modules if m.name == "daily_report")
+            _p1_trader_uc = _trader_uc
+            logger.info("P1 三个 feature 已接管（bootstrap 集中装配）")
     except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
         logger.exception("P1 bootstrap 装配失败，回退旧链路")
 
