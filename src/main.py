@@ -652,6 +652,7 @@ async def amain(config_path: str) -> None:
     collect_state: dict[str, float] = {"round_done_ts": 0.0}
     # 快照推送通道列表（见下方装配；可 telegram + ntfy 同时启用）
     snap_notifiers: list[Notifier] = []
+    _p1_snap_uc = None  # P1 usecase 装配后替换
 
     # 日报通道与状态（延迟装配，模式对齐 snap_notifiers；闭包调用时才读取列表内容）
     daily_notifiers: list[Notifier] = []
@@ -667,6 +668,11 @@ async def amain(config_path: str) -> None:
     async def trigger_snapshot_push() -> None:
         """读取最近完整桶 → 渲染总览 → 推送到快照 Bot 白名单。"""
         import hashlib
+
+        # P1 新骨架：开关打开时走 usecase
+        if _p1_snap_uc is not None:
+            await _p1_snap_uc.run()
+            return
 
         now_bucket = _current_bucket_start()
         bucket_seconds = int(snapshot_cfg.get("bucket_seconds", 7200))
@@ -968,20 +974,58 @@ async def amain(config_path: str) -> None:
     try:
         import os
         from framework.bootstrap import build_runtime
-        p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
-        p1_runtime = build_runtime(
-            storage=storage,
-            channels=[],
-            provider=type("_P", (), {"targets": staticmethod(lambda: [])})(),
-            health={},
-            collector=snap_collector,
-            catalog=None,
-            switch=p1_switch,
+        from framework.adapters.legacy_collector import LegacyCollectorAdapter
+        from framework.adapters.notifier_channel import NotifierChannel
+        from framework.store.snapshot_store import SnapshotStore
+        from framework.store.state_store import StateStore
+        from framework.scheduler.guard import BodyHashGuard
+        from framework.delivery.router import ChannelRouter
+        from framework.render.paginator import MessagePaginator
+        from framework.models.message import RenderedMessage
+        from features.market_snapshot.usecase import (
+            SnapshotPushConfig, SnapshotPushUsecase,
         )
+
+        p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
+        p1_channels = [NotifierChannel(n) for n in snap_notifiers]
+
+        class _SnapRenderer:
+            def render(self, rows, *, live_prices, now_bucket):
+                for r in rows:
+                    cid = str(r.get("condition_id") or "")
+                    if cid in live_prices:
+                        r["current_price"] = live_prices[cid]
+                    sh = r.get("volume_shares")
+                    r["volume_shares_display"] = float(sh) if sh is not None else -1.0
+                alert = render_snapshot_summary(
+                    rows,
+                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
+                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
+                    now_bucket=now_bucket,
+                )
+                if alert is None:
+                    return None
+                return RenderedMessage(body=alert.html)
+
+        class _Catalog:
+            def slugs(self): return [m.slug for m in markets]
+
         if p1_switch:
-            logger.info("P1 新骨架已启用（%d features）", len(p1_runtime.modules))
-        else:
-            logger.info("P1 新骨架已装配（默认未接管，P1_SWITCH=1 启用）")
+            cursor = StateStore(storage)
+            router = ChannelRouter(p1_channels, type("_P", (), {"targets": staticmethod(lambda: [])})())
+            guard = BodyHashGuard(cursor)
+            _p1_snap_uc = SnapshotPushUsecase(
+                catalog=_Catalog(),
+                collector=LegacyCollectorAdapter(snap_collector),
+                query=SnapshotStore(storage),
+                renderer=_SnapRenderer(),
+                router=router,
+                body_hash=guard,
+                config=SnapshotPushConfig(dedup=bool(snapshot_push_cfg.get("dedup", True)),
+                                         now_bucket=_current_bucket_start()),
+                health=snap_health,
+            )
+            logger.info("P1 快照 usecase 已接管推送")
     except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
         logger.exception("P1 bootstrap 装配失败，回退旧链路")
 
