@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from framework.models.snapshot import WindowSum
 
 
 @runtime_checkable
@@ -16,3 +19,18 @@ class CursorStore(Protocol):
     async def get(self, namespace: str, key: str) -> str | None: ...
 
     async def set(self, namespace: str, key: str, value: str) -> None: ...
+
+
+@runtime_checkable
+class SnapshotQuery(Protocol):
+    """F2/F3 用例依赖的快照查询端口（§3.2）。
+
+    latest_complete_buckets 暂时仍返回 dict 行（Snapshot 26 字段 DTO
+    待 P5 落地）；windows_sum 已返回 WindowSum DTO。
+    """
+
+    async def latest_complete_buckets(self, now_bucket: int) -> list[dict]: ...
+
+    async def windows_sum(
+        self, *, start_ts: int, end_ts: int, cid: str | None = None
+    ) -> list["WindowSum"]: ...

@@ -18,6 +18,10 @@ class SnapshotStore:
     def __init__(self, storage: "Storage") -> None:
         self._storage = storage
 
+    async def latest_complete_buckets(self, now_bucket: int) -> list[dict]:
+        """逐字平移 storage.latest_complete_buckets。"""
+        return await self._storage.latest_complete_buckets(now_bucket)
+
     async def windows_sum(
         self, *, start_ts: int, end_ts: int, cid: str | None = None
     ) -> list[WindowSum]:

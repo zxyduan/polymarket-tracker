@@ -46,3 +46,9 @@ async def test_windows_sum_basic_and_cid_filter(storage):
     # 开闭区间边界：end_ts 上界不包含
     empty = await s.windows_sum(start_ts=B, end_ts=B)
     assert empty == []
+
+
+def test_snapshot_store_satisfies_query_protocol(storage):
+    from framework.models.ports import SnapshotQuery
+    from framework.store.snapshot_store import SnapshotStore
+    assert isinstance(SnapshotStore(storage), SnapshotQuery)
