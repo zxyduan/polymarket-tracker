@@ -992,23 +992,11 @@ async def amain(config_path: str) -> None:
         p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
         p1_channels = [NotifierChannel(n) for n in snap_notifiers]
 
-        class _SnapRenderer:
-            def render(self, rows, *, live_prices, now_bucket):
-                for r in rows:
-                    cid = str(r.get("condition_id") or "")
-                    if cid in live_prices:
-                        r["current_price"] = live_prices[cid]
-                    sh = r.get("volume_shares")
-                    r["volume_shares_display"] = float(sh) if sh is not None else -1.0
-                alert = render_snapshot_summary(
-                    rows,
-                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
-                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
-                    now_bucket=now_bucket,
-                )
-                if alert is None:
-                    return None
-                return RenderedMessage(body=alert.html)
+        from features.market_snapshot.renderer import LegacySnapshotRenderer
+        from features.daily_report.renderer import LegacyDailyRenderer
+        from features.daily_report.usecase import (
+            DailyReportConfig, DailyReportUsecase,
+        )
 
         class _Catalog:
             def slugs(self): return [m.slug for m in markets]
@@ -1021,7 +1009,10 @@ async def amain(config_path: str) -> None:
                 catalog=_Catalog(),
                 collector=LegacyCollectorAdapter(snap_collector),
                 query=SnapshotStore(storage),
-                renderer=_SnapRenderer(),
+                renderer=LegacySnapshotRenderer(
+                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
+                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
+                ),
                 router=router,
                 body_hash=guard,
                 config=SnapshotPushConfig(dedup=bool(snapshot_push_cfg.get("dedup", True)),
@@ -1030,25 +1021,6 @@ async def amain(config_path: str) -> None:
             )
             logger.info("P1 快照 usecase 已接管推送")
 
-            from features.daily_report.usecase import (
-                DailyReportConfig, DailyReportUsecase,
-            )
-            from src.main import render_daily_volume_report  # 同模块内
-
-            class _DailyRenderer:
-                def render(self, rows, *, windows_days, now_bucket,
-                           tz_offset_hours, top_n):
-                    rep = render_daily_volume_report(
-                        rows, windows_days=windows_days, now_bucket=now_bucket,
-                        tz_offset_hours=tz_offset_hours, top_n=top_n,
-                    )
-                    if rep is None:
-                        return None
-                    body = rep.title + "\n" + "\n".join(rep.market_lines)
-                    if rep.footer:
-                        body += "\n" + rep.footer
-                    return RenderedMessage(body=body)
-
             daily_router = ChannelRouter(
                 [NotifierChannel(n) for n in daily_notifiers],
                 type("_P", (), {"targets": staticmethod(lambda: [])})(),
@@ -1056,7 +1028,7 @@ async def amain(config_path: str) -> None:
             _p1_daily_uc = DailyReportUsecase(
                 catalog=_Catalog(),
                 query=SnapshotStore(storage),
-                renderer=_DailyRenderer(),
+                renderer=LegacyDailyRenderer(),
                 router=daily_router,
                 paginator=MessagePaginator(),
                 body_hash=guard,
