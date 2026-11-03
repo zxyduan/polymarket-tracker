@@ -1042,6 +1042,22 @@ async def amain(config_path: str) -> None:
                 health=daily_health,
             )
             logger.info("P1 日报 usecase 已接管")
+
+            from features.trader.usecase import TraderAlertUsecase, TraderConfig
+            from framework.adapters.notifier_channel import NotifierChannel as _NC
+
+            trader_router = ChannelRouter(
+                [_NC(n) for n in trader_notifiers],
+                type("_P", (), {"targets": staticmethod(lambda: [])})(),
+            )
+            _p1_trader_uc = TraderAlertUsecase(
+                renderer=None,  # TODO: AlertRenderer 适配层待写
+                router=trader_router,
+                guard=None,
+                config=TraderConfig(),
+                health={},
+            )
+            logger.info("P1 trader usecase 已构造（未接管队列）")
     except Exception:  # noqa: BLE001 - 装配失败不影响旧链路
         logger.exception("P1 bootstrap 装配失败，回退旧链路")
 
