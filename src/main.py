@@ -989,7 +989,7 @@ async def amain(config_path: str) -> None:
             SnapshotPushConfig, SnapshotPushUsecase,
         )
 
-        p1_switch = os.environ.get("P1_SWITCH", "0") == "1"
+        p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
         p1_channels = [NotifierChannel(n) for n in snap_notifiers]
 
         from features.market_snapshot.renderer import LegacySnapshotRenderer
