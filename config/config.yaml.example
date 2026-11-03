@@ -77,6 +77,16 @@ snapshot:
   wall_min_notional: 100.0     # 订单簿"墙"阈值（USDC）
   request_timeout_seconds: 15
 
+# 日报：当日成交份额汇总推送
+daily_report:
+  enabled: true
+  schedule: "08:00"             # 每日推送时刻
+  windows_days: [1, 7, 30]      # 窗口天数
+  timezone_offset_hours: 8
+  top_n: 10                     # Top N 市场
+  page_size: 20
+  dedup: true
+
 # 服务端点（集中配置，接口变更只改这里）
 endpoints:
   rtds: "wss://ws-live-data.polymarket.com"
