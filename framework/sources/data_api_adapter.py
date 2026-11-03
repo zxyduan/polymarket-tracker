@@ -17,7 +17,7 @@ import httpx
 
 from framework.models.ports import CursorStore
 from framework.parsing.data_parsing import parse_data_trades
-from src.core.models import StandardEvent
+from framework.models.event import StandardEvent
 
 logger = logging.getLogger(__name__)
 

@@ -1,7 +1,7 @@
 """服务入口：parse args → build_app → wait stop → shutdown。
 
 装配逻辑在 framework/app.py，运行时循环在 framework/runtime/loops.py。
-本文件仅做命令行入口和必要的 re-export（兼容旧测试 import）。
+本文件仅做命令行入口。
 """
 
 from __future__ import annotations
@@ -9,12 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-
-# Re-export：测试仍从 src.main import 这些符号（避免大规模改测试 import）
-from framework.runtime.loops import (  # noqa: F401
-    _parse_snapshot_schedule,
-    daily_report_loop,
-)
 
 logger = logging.getLogger("main")
 

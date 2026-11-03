@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from src.snapshots import collector as col
-from src.snapshots.renderer import render_snapshot_summary
+from features.market_snapshot.renderer import SnapshotSummaryRenderer
 from src.storage import Storage
 
 
@@ -172,9 +172,9 @@ def test_render_summary() -> None:
         _row("kkkkkkk", "clarity-act-signed-into-law-in-2026", bucket, 1240, "up", 0.021, "high"),
         _row("abcdefg", "who-wins-2026", bucket, 312, "flat", 0.0, "low"),
     ]
-    alert = render_snapshot_summary(rows, tz_offset_hours=8)
+    alert = SnapshotSummaryRenderer(tz_offset_hours=8).render(rows, live_prices={}, now_bucket=bucket + 7200)
     assert alert is not None
-    body = alert.html
+    body = alert.body
     # slug_id 展示，不出现完整 slug
     assert "kkkkkkk" in body
     assert "clarity-act-signed-into-law-in-2026" not in body
@@ -190,38 +190,34 @@ def test_render_summary() -> None:
 
 
 def test_render_summary_empty() -> None:
-    assert render_snapshot_summary([], tz_offset_hours=8) is None
+    assert SnapshotSummaryRenderer(tz_offset_hours=8).render([], live_prices={}) is None
 
 
 def test_render_fallback_slug() -> None:
     bucket = (int(time.time()) // 7200) * 7200 - 7200
     rows = [_row("", "clarity-act-signed-into-law-in-2026", bucket)]
-    alert = render_snapshot_summary(rows, tz_offset_hours=8)
+    alert = SnapshotSummaryRenderer(tz_offset_hours=8).render(rows, live_prices={}, now_bucket=bucket + 7200)
     assert alert is not None
-    assert "clarity-act-signed-into-law-in-2026" in alert.html
+    assert "clarity-act-signed-into-law-in-2026" in alert.body
 
 
 def test_render_summary_healthy_no_stale_warning() -> None:
     """健康状态：最新闭合桶落后当前桶恰好 1 个，不显示延迟告警。"""
     now_bucket = (int(time.time()) // 7200) * 7200
     rows = [_row("aaaa", "slug-a", now_bucket - 7200)]
-    alert = render_snapshot_summary(
-        rows, tz_offset_hours=8, now_bucket=now_bucket
-    )
+    alert = SnapshotSummaryRenderer(tz_offset_hours=8).render(rows, live_prices={}, now_bucket=now_bucket)
     assert alert is not None
-    assert "数据延迟" not in alert.html
+    assert "数据延迟" not in alert.body
 
 
 def test_render_summary_stale_warning() -> None:
     """采集停摆：最新闭合桶落后 >=2 个桶，标题下必须出现延迟告警。"""
     now_bucket = (int(time.time()) // 7200) * 7200
     rows = [_row("aaaa", "slug-a", now_bucket - 9 * 7200)]
-    alert = render_snapshot_summary(
-        rows, tz_offset_hours=8, now_bucket=now_bucket
-    )
+    alert = SnapshotSummaryRenderer(tz_offset_hours=8).render(rows, live_prices={}, now_bucket=now_bucket)
     assert alert is not None
-    assert "数据延迟约 16 小时" in alert.html
-    assert "采集异常" in alert.html
+    assert "数据延迟约 16 小时" in alert.body
+    assert "采集异常" in alert.body
 
 
 def test_render_summary_mixed_buckets_labeled() -> None:
@@ -231,11 +227,9 @@ def test_render_summary_mixed_buckets_labeled() -> None:
         _row("aaaa", "slug-a", now_bucket - 3 * 7200),
         _row("bbbb", "slug-b", now_bucket - 7200),
     ]
-    alert = render_snapshot_summary(
-        rows, tz_offset_hours=8, now_bucket=now_bucket
-    )
+    alert = SnapshotSummaryRenderer(tz_offset_hours=8).render(rows, live_prices={}, now_bucket=now_bucket)
     assert alert is not None
-    assert "桶）" in alert.html  # 落后的 aaaa 行带桶时段标注
+    assert "桶）" in alert.body  # 落后的 aaaa 行带桶时段标注
 
 
 # ── 存储 ────────────────────────────────────────────────────────────────

@@ -15,16 +15,15 @@ from typing import Any
 
 import pytest
 
-import src.main as m
-from src.main import daily_report_loop
+from framework.runtime.loops import daily_report_loop
 from framework.runtime import loops as runtime_loops
+from features.daily_report.renderer import DailyReportRenderer
 from src.settings import DailyReportConfig, MarketEntry, Settings, resolve_daily_config
 from src.snapshots.commands import (
     DailyCommandHandler,
     SnapshotCommandHandler,
     daily_result_reply,
 )
-from src.snapshots.renderer import render_daily_volume_report
 from src.storage import Storage
 
 R0 = 1_730_000_400  # 固定桶右端点（偶数小时对齐，仅测试用）
@@ -173,47 +172,39 @@ def _row(cid, slug_id, d1, d3, d7):
 
 
 def test_renderer_sort_tie_and_none():
+    r = DailyReportRenderer()
     rows = [
         _row("0xb", "B", 100, 200, 300),
         _row("0xa", "A", 100, 200, 300),
         _row("0xc", "C", 500, 600, 700),
     ]
-    rep = render_daily_volume_report(
-        rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
-    )
-    assert rep is not None
-    assert rep.market_lines[0].startswith("1️⃣ C")
-    assert rep.total == 3
-    assert not hasattr(rep, "segment") and not hasattr(rep, "page")
-    assert render_daily_volume_report(
-        [], windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
-    ) is None
+    msg = r.render(rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0)
+    assert msg is not None
+    assert "1️⃣ C" in msg.body
+    assert r.render([], windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0) is None
 
 
 def test_renderer_text_redlines_and_thousands():
+    r = DailyReportRenderer()
     rows = [_row("0xa", "a<b&c", 128540, 356208, 812940)]
-    rep = render_daily_volume_report(
-        rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
-    )
-    assert "截至今晨06:00" in rep.title
-    body = "\n".join(rep.market_lines)
-    assert "128,540" in body and "356,208" in body and "812,940" in body
-    assert "$" not in body and "USDC" not in body and "USD" not in body
-    assert "&lt;" in rep.market_lines[0]
+    msg = r.render(rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0)
+    assert msg is not None
+    assert "截至今晨06:00" in msg.body
+    assert "128,540" in msg.body and "356,208" in msg.body and "812,940" in msg.body
+    assert "$" not in msg.body and "USDC" not in msg.body and "USD" not in msg.body
+    assert "&lt;" in msg.body
 
 
 def test_renderer_truncate():
+    r = DailyReportRenderer()
     rows = [_row(f"0x{i}", f"M{i}", i * 10, i * 20, i * 30) for i in range(1, 8)]
-    rep = render_daily_volume_report(
-        rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=5
-    )
-    assert len(rep.market_lines) == 5
-    assert "其余 2 个市场未列出" == rep.truncated_note
-    assert rep.total == 7
-    rep0 = render_daily_volume_report(
-        rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0
-    )
-    assert rep0.truncated_note == ""
+    msg = r.render(rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=5)
+    assert msg is not None
+    assert "其余 2 个市场未列出" in msg.body
+    # top_n=0 不截断
+    msg0 = r.render(rows, windows_days=[1, 3, 7], now_bucket=R0, tz_offset_hours=8, top_n=0)
+    assert msg0 is not None
+    assert "其余" not in msg0.body
 
 
 # ───────────────────────────── 6.6 调度状态机 ────────────────────────────────────
@@ -406,7 +397,7 @@ def test_factory_telegram_api_none_skips():
 
 
 def test_fmt_shares_not_duplicated():
-    src = Path("src/snapshots/renderer.py").read_text(encoding="utf-8")
+    src = Path("features/daily_report/renderer.py").read_text(encoding="utf-8")
     assert src.count("def _fmt_shares(") == 1
 
 

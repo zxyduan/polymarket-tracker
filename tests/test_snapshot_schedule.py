@@ -1,6 +1,6 @@
 """快照推送时间表解析测试。"""
 
-from src.main import _parse_snapshot_schedule
+from framework.runtime.loops import _parse_snapshot_schedule
 
 
 def test_parse_basic_schedule() -> None:

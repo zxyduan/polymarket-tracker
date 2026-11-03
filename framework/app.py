@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import signal
 from typing import Any
 
@@ -16,7 +15,7 @@ from dotenv import load_dotenv
 from src.bot.auth import AuthManager
 from src.bot.commands import CommandHandler
 from src.bot.telegram import BotRunner, TelegramApi
-from src.core.models import StandardEvent
+from framework.models.event import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
 from src.notify import Notifier, build_notifiers
@@ -289,48 +288,43 @@ async def build_app(config_path: str) -> AppHandle:
                 lambda: daily_report_loop(storage, daily_cfg, _fire_daily_report, stop_event),
                 stop_event)))
 
-    # ── P1 bootstrap ──
-    try:
-        p1_switch = os.environ.get("P1_SWITCH", "1") == "1"
-        if p1_switch:
-            from framework.bootstrap import build_runtime
-            from features.market_snapshot.renderer import LegacySnapshotRenderer
-            from features.daily_report.renderer import LegacyDailyRenderer
-            from features.trader.renderer import LegacyTraderRenderer
-            from features.market_snapshot.usecase import SnapshotPushConfig
-            from features.daily_report.usecase import DailyReportConfig
+    # ── feature bootstrap（必须成功，失败直接 crash）──
+    from framework.bootstrap import build_runtime
+    from features.market_snapshot.renderer import SnapshotSummaryRenderer
+    from features.daily_report.renderer import DailyReportRenderer
+    from features.trader.renderer import LegacyTraderRenderer
+    from features.market_snapshot.usecase import SnapshotPushConfig
+    from features.daily_report.usecase import DailyReportConfig
 
-            class _Catalog:
-                def slugs(self): return [m.slug for m in markets]
+    class _Catalog:
+        def slugs(self): return [m.slug for m in markets]
 
-            _rt, _trader_uc = build_runtime(
-                storage=storage, collector=snap_collector, catalog=_Catalog(),
-                snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
-                trader_notifiers=trader_notifiers,
-                snap_renderer=LegacySnapshotRenderer(
-                    tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
-                    bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
-                ),
-                daily_renderer=LegacyDailyRenderer(),
-                trader_renderer=LegacyTraderRenderer(),
-                snap_cfg=SnapshotPushConfig(
-                    dedup=bool(snapshot_push_cfg.get("dedup", True)),
-                    now_bucket=_current_bucket_start(),
-                ),
-                daily_cfg=DailyReportConfig(
-                    windows_days=list(daily_cfg.windows_days),
-                    timezone_offset_hours=daily_cfg.timezone_offset_hours,
-                    top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
-                    now_bucket=_current_bucket_start(),
-                ),
-                snap_health=snap_health, daily_health=daily_health,
-            )
-            p1["snap"] = next(m.run for m in _rt.modules if m.name == "market_snapshot")
-            p1["daily"] = next(m.run for m in _rt.modules if m.name == "daily_report")
-            p1["trader"] = _trader_uc
-            logger.info("P1 三个 feature 已接管")
-    except Exception:  # noqa: BLE001
-        logger.exception("P1 bootstrap 装配失败")
+    _rt, _trader_uc = build_runtime(
+        storage=storage, collector=snap_collector, catalog=_Catalog(),
+        snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
+        trader_notifiers=trader_notifiers,
+        snap_renderer=SnapshotSummaryRenderer(
+            tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8)),
+            bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
+        ),
+        daily_renderer=DailyReportRenderer(),
+        trader_renderer=LegacyTraderRenderer(),
+        snap_cfg=SnapshotPushConfig(
+            dedup=bool(snapshot_push_cfg.get("dedup", True)),
+            now_bucket=_current_bucket_start(),
+        ),
+        daily_cfg=DailyReportConfig(
+            windows_days=list(daily_cfg.windows_days),
+            timezone_offset_hours=daily_cfg.timezone_offset_hours,
+            top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
+            now_bucket=_current_bucket_start(),
+        ),
+        snap_health=snap_health, daily_health=daily_health,
+    )
+    p1["snap"] = next(m.run for m in _rt.modules if m.name == "market_snapshot")
+    p1["daily"] = next(m.run for m in _rt.modules if m.name == "daily_report")
+    p1["trader"] = _trader_uc
+    logger.info("三个 feature 已接管")
 
     # 信号处理
     loop = asyncio.get_running_loop()

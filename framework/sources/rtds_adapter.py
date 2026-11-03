@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from src.core.models import StandardEvent
+from framework.models.event import StandardEvent
 from src.sources.rtds_client import RtdsClient
 
 if TYPE_CHECKING:
