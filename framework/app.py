@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -144,20 +145,45 @@ async def build_app(config_path: str) -> AppHandle:
     p1: dict[str, Any] = {}
 
     async def _trader_consumer(queue, stop):
+        # 推送汇总计数器：每 60s 打一次成功/失败汇总日志
+        stats = {"success": 0, "failed": 0, "start_ts": time.time()}
+        FLUSH_INTERVAL = 60.0
+
         while not stop.is_set():
             alert = await queue.get()
             try:
                 if "trader" in p1:
-                    await p1["trader"].handle(alert)
+                    result = await p1["trader"].handle(alert)
+                    # 从 DeliveryResult 统计通道失败数
+                    failed_channels = len(result.channel_failures)
+                    if failed_channels == 0:
+                        stats["success"] += 1
+                    else:
+                        stats["failed"] += failed_channels
                 else:
                     for n in trader_notifiers:
                         try:
                             await n.send(alert.html, buttons=alert.buttons,
                                          event_keys=alert.event_keys)
+                            stats["success"] += 1
                         except Exception as exc:
+                            stats["failed"] += 1
                             logger.error("推送失败(%s): %s", n.describe(), exc)
             finally:
                 queue.task_done()
+
+            # 定时汇总推送日志
+            now = time.time()
+            if now - stats["start_ts"] >= FLUSH_INTERVAL:
+                total = stats["success"] + stats["failed"]
+                logger.info(
+                    "trader 推送汇总：成功 %d 条，失败 %d 条（窗口 %.0fs，共 %d 条）",
+                    stats["success"], stats["failed"],
+                    now - stats["start_ts"], total,
+                )
+                stats["success"] = 0
+                stats["failed"] = 0
+                stats["start_ts"] = now
 
     # ── 日报 ──
     daily_notifiers: list[Notifier] = []
@@ -312,6 +338,7 @@ async def build_app(config_path: str) -> AppHandle:
         snap_cfg=SnapshotPushConfig(
             dedup=bool(snapshot_push_cfg.get("dedup", True)),
             now_bucket=_current_bucket_start(),
+            bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
         ),
         daily_cfg=DailyReportConfig(
             windows_days=list(daily_cfg.windows_days),

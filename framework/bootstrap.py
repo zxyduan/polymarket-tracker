@@ -54,7 +54,7 @@ def build_runtime(*, storage: Any, collector: Any, catalog: Any,
         config=daily_cfg, health=daily_health,
     )
     trader_uc = TraderAlertUsecase(
-        renderer=trader_renderer, router=trader_router, guard=None,
+        renderer=trader_renderer, router=trader_router, guard=guard,
         config=TraderConfig(), health={},
     )
 

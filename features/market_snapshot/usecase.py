@@ -28,6 +28,7 @@ class MarketCatalog(Protocol):
 class SnapshotPushConfig:
     dedup: bool = True
     max_stale_buckets: int = 24
+    bucket_seconds: int = 7200  # 2h 桶大小，用于计算滞后桶数
     now_bucket: int = 0   # 0 = 由注入的时钟计算；测试可覆盖
 
 
@@ -82,8 +83,19 @@ class SnapshotPushUsecase:
         if not rows:
             return
 
-        # 5) 陈旧守卫（行数/时间由调用方在 rows 外判断，这里留钩子）
+        # 5) 陈旧守卫：最新闭合桶落后 max_stale_buckets 个桶则跳过推送
+        #    避免采集中断后，整点仍照常推送过时数据误导用户
         self._health["last_rows"] = len(rows)
+        if self._cfg.max_stale_buckets > 0 and now_bucket:
+            latest_bucket = max(int(r.get("bucket_ts", 0)) for r in rows)
+            lag_buckets = (now_bucket - latest_bucket) // self._cfg.bucket_seconds
+            if lag_buckets >= self._cfg.max_stale_buckets:
+                logger.warning(
+                    "快照陈旧守卫触发：最新桶落后 %d 个桶（阈值 %d），跳过本次推送",
+                    lag_buckets, self._cfg.max_stale_buckets,
+                )
+                self._health["stale_skipped"] = lag_buckets
+                return
 
         # 6) 实时价
         try:
