@@ -20,3 +20,7 @@ __pycache__/
 *.zip
 *.bak.*
 docs/
+0043.patch
+doc/baseline-*
+doc/pytest-output.txt
+doc/b4b5-refs.txt
