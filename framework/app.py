@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -144,46 +143,39 @@ async def build_app(config_path: str) -> AppHandle:
     # P1 usecase 引用容器（装配后填充）
     p1: dict[str, Any] = {}
 
-    async def _trader_consumer(queue, stop):
-        # 推送汇总计数器：每 60s 打一次成功/失败汇总日志
-        stats = {"success": 0, "failed": 0, "start_ts": time.time()}
-        FLUSH_INTERVAL = 60.0
+    # 灰度开关：交易推送新路径是否启用（默认开，出问题设 false 回退旧路径）
+    p1_trader_enabled = bool(settings.get("p1.trader_enabled", True))
+    if p1_trader_enabled:
+        logger.info("交易推送新路径（P1 TraderAlertUsecase）已启用")
+    else:
+        logger.warning("交易推送新路径已关闭，走旧 Notifier 直连路径")
 
+    async def _trader_consumer(queue, stop):
         while not stop.is_set():
             alert = await queue.get()
             try:
-                if "trader" in p1:
+                if p1_trader_enabled and "trader" in p1:
                     result = await p1["trader"].handle(alert)
-                    # 从 DeliveryResult 统计通道失败数
-                    failed_channels = len(result.channel_failures)
-                    if failed_channels == 0:
-                        stats["success"] += 1
+                    title = getattr(alert, "title", "") or "交易告警"
+                    if result.channel_failures:
+                        logger.error(
+                            "推送失败：%s（%d 个通道失败）",
+                            title, len(result.channel_failures),
+                        )
                     else:
-                        stats["failed"] += failed_channels
+                        logger.info("推送成功：%s", title)
                 else:
                     for n in trader_notifiers:
                         try:
                             await n.send(alert.html, buttons=alert.buttons,
                                          event_keys=alert.event_keys)
-                            stats["success"] += 1
+                            logger.info(
+                                "推送成功（旧路径）：%s", n.describe()
+                            )
                         except Exception as exc:
-                            stats["failed"] += 1
                             logger.error("推送失败(%s): %s", n.describe(), exc)
             finally:
                 queue.task_done()
-
-            # 定时汇总推送日志
-            now = time.time()
-            if now - stats["start_ts"] >= FLUSH_INTERVAL:
-                total = stats["success"] + stats["failed"]
-                logger.info(
-                    "trader 推送汇总：成功 %d 条，失败 %d 条（窗口 %.0fs，共 %d 条）",
-                    stats["success"], stats["failed"],
-                    now - stats["start_ts"], total,
-                )
-                stats["success"] = 0
-                stats["failed"] = 0
-                stats["start_ts"] = now
 
     # ── 日报 ──
     daily_notifiers: list[Notifier] = []

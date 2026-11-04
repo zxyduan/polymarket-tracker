@@ -45,8 +45,21 @@ class DataApiClient:
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.page_limit = page_limit
 
-    async def cold_start(self, wallets: list[dict[str, Any]], storage: Any) -> None:
-        """冷启动：仅记录每个地址的最新事件时间，不推送。任一失败则整体抛出由 main 重试。"""
+    async def cold_start(
+        self,
+        wallets: list[dict[str, Any]],
+        storage: Any,
+        *,
+        max_backfill_minutes: int = 120,
+    ) -> None:
+        """冷启动：建立对账基线，不推送。任一失败则整体抛出由 main 重试。
+
+        - 首次启动：记录最新事件时间为基线，之前的历史不推
+        - 重启：保留旧基线，补推重启期间的交易；若停机超过 max_backfill_minutes，
+          把基线截断为最近 max_backfill_minutes，只补推最近窗口内的事件，避免刷屏
+        """
+        from datetime import timedelta
+
         failures: list[str] = []
         for wallet in wallets:
             address = wallet["address"]
@@ -57,11 +70,41 @@ class DataApiClient:
                 failures.append(address)
                 logger.warning("冷启动 %s 失败: %s", address, exc)
                 continue
+
+            last_time_raw = await storage.get_state(f"data_api:{address}:last_time")
+            old_last_time = (
+                datetime.fromisoformat(last_time_raw) if last_time_raw else None
+            )
             latest = self._latest_time(events)
-            if latest is not None:
-                await storage.set_state(
-                    f"data_api:{address}:last_time", latest.isoformat()
-                )
+
+            if old_last_time is None:
+                # 首次启动：记录最新事件时间为基线
+                if latest is not None:
+                    await storage.set_state(
+                        f"data_api:{address}:last_time", latest.isoformat()
+                    )
+                logger.info("冷启动 %s：首次建立基线 %s", address, latest)
+            else:
+                # 重启：判断停机时长，决定补推窗口
+                now = datetime.now(timezone.utc)
+                downtime_min = (now - old_last_time).total_seconds() / 60
+                max_backfill = timedelta(minutes=max_backfill_minutes)
+                if now - old_last_time > max_backfill:
+                    # 停机太久，截断补推窗口为最近 max_backfill_minutes
+                    truncated = now - max_backfill
+                    await storage.set_state(
+                        f"data_api:{address}:last_time", truncated.isoformat()
+                    )
+                    logger.info(
+                        "冷启动 %s：重启，停机 %.1f 分钟，补推窗口截断为最近 %d 分钟",
+                        address, downtime_min, max_backfill_minutes,
+                    )
+                else:
+                    # 短停机：保留旧基线，对账时自动补推全部重启期间交易
+                    logger.info(
+                        "冷启动 %s：重启，停机 %.1f 分钟，将补推全部交易",
+                        address, downtime_min,
+                    )
         if failures:
             raise RuntimeError(
                 f"冷启动 {len(failures)} 个地址失败（网络/限流），需重试"
