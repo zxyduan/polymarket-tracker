@@ -7,12 +7,12 @@ from framework.models.message import RenderedMessage
 
 
 class Good:
-    async def send(self, body): self.body = body
+    async def send(self, body, buttons=None, event_keys=None): self.body = body
     def describe(self): return "tg"
 
 
 class Bad:
-    async def send(self, body): raise RuntimeError("boom")
+    async def send(self, body, buttons=None, event_keys=None): raise RuntimeError("boom")
     def describe(self): return "ntfy"
 
 

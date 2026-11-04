@@ -8,11 +8,14 @@ dispatch(feature, msg) 的 feature 参数只用于落痕归属与日志，不承
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, Sequence, runtime_checkable
 
 from framework.models.message import RenderedMessage
 from framework.delivery.targets import DeliveryTarget
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ class ChannelRouter:
         for channel in self._channels:
             targets = [t for t in self._provider.targets() if t.channel == channel.name]
             if not targets:
+                logger.warning("router: channel %s 无 targets，跳过", channel.name)
                 continue
             try:
                 result = await channel.deliver(msg, targets)

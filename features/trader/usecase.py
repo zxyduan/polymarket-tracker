@@ -35,6 +35,9 @@ class TraderAlertUsecase:
     async def handle(self, event: Any) -> None:
         msg = self._renderer.render(event)
         if msg is None:
+            logger.warning("trader: render 返回 None，跳过")
             return
         result = await self._router.dispatch("trader", msg)
         self._health["trader_failures"] = len(result.channel_failures)
+        if result.channel_failures:
+            logger.error("trader: %d 通道推送失败", len(result.channel_failures))
