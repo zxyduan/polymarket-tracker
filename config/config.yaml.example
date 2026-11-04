@@ -119,3 +119,8 @@ safe_proxy:
   factory: "0xaacFe3a05d134b1b169f736553b30dca3eedf04d"
   singleton: "0xfb1bffC9d739B8D520DaF37dF666da4C687191EA"
   proxy_init_code: ""
+
+# P1 灰度开关
+p1:
+  trader_enabled: true   # 交易推送新路径开关，出问题设 false 回退旧路径
+
