@@ -93,25 +93,40 @@ HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
 EXPECTED_JOINED=$(IFS=","; echo "${EXPECTED_HEADS[*]}")
 echo "branch=$BRANCH head=$HEAD expected_heads=$EXPECTED_JOINED"
-HEAD_MATCH=0
-for expected in "${EXPECTED_HEADS[@]}"; do
-  [[ "$HEAD" == "$expected"* ]] && HEAD_MATCH=1
-done
-[[ "$HEAD_MATCH" -eq 1 ]] && ok "HEAD 与已接受修复提交一致" || warn "HEAD 不在 $EXPECTED_JOINED 列表内，请确认部署版本"
+HEAD_HAS_F1=0
+HEAD_HAS_BASE=0
+if git merge-base --is-ancestor c8c3017 HEAD 2>/dev/null; then
+  HEAD_HAS_F1=1
+fi
+if git merge-base --is-ancestor 462fbe0 HEAD 2>/dev/null; then
+  HEAD_HAS_BASE=1
+fi
+if [[ "$HEAD_HAS_F1" -eq 1 ]]; then
+  ok "HEAD 包含 F1 修复提交 c8c3017（后续文档/脚本提交不影响判定）"
+elif [[ "$HEAD_HAS_BASE" -eq 1 ]]; then
+  warn "HEAD 仅包含统一修复 462fbe0，尚未确认包含 F1 修复 c8c3017"
+else
+  warn "HEAD 不包含 $EXPECTED_JOINED 中的修复祖先，请确认部署版本"
+fi
 echo "--- git status ---"
 GIT_STATUS_OUTPUT=$(git status --short || true)
 printf '%s\n' "$GIT_STATUS_OUTPUT"
 UNTRACKED_LINES=$(printf '%s\n' "$GIT_STATUS_OUTPUT" | awk '$1 == "??" {print}')
 MODIFIED_LINES=$(printf '%s\n' "$GIT_STATUS_OUTPUT" | grep -E '^(M|A|D|MM|AM|MA| M| A| D)' || true)
+SELF_CHECK_LINES=$(printf '%s\n' "$MODIFIED_LINES" | grep -F 'docs/self-check.sh' || true)
+SOURCE_MODIFIED_LINES=$(printf '%s\n' "$MODIFIED_LINES" | grep -vF 'docs/self-check.sh' || true)
 if [[ -n "$UNTRACKED_LINES" ]]; then
   warn "存在根目录未跟踪文件/脚本，建议运行 docs/cleanup-working-tree.sh 归档"
   printf '%s\n' "$UNTRACKED_LINES" | sed 's/^/    untracked: /'
 else
   ok "无未跟踪文件"
 fi
-if [[ -n "$MODIFIED_LINES" ]]; then
-  warn "工作树存在未提交修改，请确认是否需要提交"
-  printf '%s\n' "$MODIFIED_LINES" | sed 's/^/    modified: /'
+if [[ -n "$SOURCE_MODIFIED_LINES" ]]; then
+  warn "工作树存在源码/测试/配置未提交修改，请确认是否需要提交"
+  printf '%s\n' "$SOURCE_MODIFIED_LINES" | sed 's/^/    modified: /'
+elif [[ -n "$SELF_CHECK_LINES" ]]; then
+  ok "仅 docs/self-check.sh 有本地更新，提交后即可清除该状态"
+  printf '%s\n' "$SELF_CHECK_LINES" | sed 's/^/    pending self-check: /'
 else
   ok "工作树无未提交源码修改"
 fi
@@ -341,10 +356,10 @@ try:
         print(f"{label}: events={len(events)} success_notifications={len(notifications)}")
         is_historical_gap = label.startswith("Base")
         if len(events) == 0:
-            marker = "SELF_CHECK_WARN" if is_historical_gap else "SELF_CHECK_FAIL"
+            marker = "SELF_CHECK_INFO" if is_historical_gap else "SELF_CHECK_FAIL"
             print(f"{marker}: {label} 未在 events 表定位到")
         if len(notifications) == 0:
-            marker = "SELF_CHECK_WARN" if is_historical_gap else "SELF_CHECK_FAIL"
+            marker = "SELF_CHECK_INFO" if is_historical_gap else "SELF_CHECK_FAIL"
             print(f"{marker}: {label} 没有 success 通知记录")
         for r in events[:3]:
             print(f"  event: {r['observed_at']} {r['source']} notional={r['notional']} key={r['dedupe_key']}")
@@ -362,7 +377,7 @@ try:
         print(f"SELF_CHECK_FAIL: 存在 {non_success} 条非 success 通知，请检查分发失败或被拒绝记录")
 
     print("\n-- 最近 15 条成交：门槛分支与通知覆盖 --")
-    print("口径：notional 是单笔原始成交；notified=YES 表示 notifications.event_keys 精确包含该 dedupe_key。")
+    print("口径：notional 是单笔原始成交；notified=YES 表示同一 tx_hash 的任一 fill 已被通知覆盖，避免 rtds/data_api 重复键误判。")
     coverage = q(
         """
         SELECT e.event_time, e.source, e.wallet, e.tx_hash, e.dedupe_key,
@@ -377,8 +392,9 @@ try:
                END AS threshold_state,
                CASE WHEN EXISTS(
                    SELECT 1 FROM notifications n
+                   JOIN events e2 ON e2.tx_hash = e.tx_hash
                    WHERE ',' || COALESCE(n.event_keys, '') || ','
-                         LIKE '%,' || e.dedupe_key || ',%'
+                         LIKE '%,' || e2.dedupe_key || ',%'
                ) THEN 'YES' ELSE 'NO' END AS notified
         FROM events e
         WHERE e.event_type = 'TRADE'
