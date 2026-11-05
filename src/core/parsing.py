@@ -35,7 +35,7 @@ _PRICE_KEYS = ("price", "limitPrice", "avgPrice")
 _SIZE_KEYS = ("size", "amount", "matchedAmount", "quantity", "shares")
 _OUTCOME_KEYS = ("outcome", "outcomeLabel", "tokenLabel")
 _SIDE_KEYS = ("side", "takerSide")
-_NOTIONAL_KEYS = ("usdcSize", "notional", "value", "usdcAmount", "payout")
+_NOTIONAL_KEYS = ("usdcSize", "usdc_size", "notional", "value", "usdcAmount", "usdc_value", "payout")
 
 
 def first_key(data: dict[str, Any], *keys: str) -> Any:

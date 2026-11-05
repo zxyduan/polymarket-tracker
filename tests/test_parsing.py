@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from src.core.models import REDEEM, TRADE
 from src.core.parsing import (
+    build_trade,
     parse_data_activity,
     parse_data_trade,
     parse_rtds_message,
@@ -72,3 +73,23 @@ def test_data_activity_list() -> None:
         [s.DATA_ACTIVITY_TRADE, s.DATA_ACTIVITY_REDEEM]
     )
     assert len(events) == 2
+
+
+def test_data_trade_prefers_usdc_size_snake_case() -> None:
+    event = build_trade(
+        {
+            "proxyWallet": s.W5,
+            "side": "BUY",
+            "outcome": "No",
+            "price": "0.84",
+            "size": "40.29",
+            "usdc_size": "33.8436",
+            "transaction_hash": "0xc255",
+            "timestamp": 1793850399,
+        },
+        "data_api",
+    )
+    assert event is not None
+    assert event.notional == Decimal("33.8436")
+    assert event.outcome == "No"
+    assert event.tx_hash == "0xc255"

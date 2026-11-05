@@ -193,12 +193,25 @@ class DataApiClient:
             )
         return new_events
 
+    def _trade_params(self, address: str, cursor: str | None) -> dict[str, Any]:
+        """构造成交查询参数。
+
+        `/v2/trades` 默认 `taker_only=true`，只返回 taker 侧行；监控账户成交时需要
+        同时保留 maker 行，否则本地 Profile 上的 maker 成交会被兜底源漏掉。
+        """
+        params: dict[str, Any] = {
+            "user": address,
+            "limit": self.page_limit,
+            "taker_only": "false",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return params
+
     async def _fetch_page(
         self, address: str, cursor: str | None
     ) -> tuple[list[Any], str | None]:
-        params: dict[str, Any] = {"user": address, "limit": self.page_limit}
-        if cursor:
-            params["cursor"] = cursor
+        params = self._trade_params(address, cursor)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(f"{self.base_url}/v2/trades", params=params)
             response.raise_for_status()
