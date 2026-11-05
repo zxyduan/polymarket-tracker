@@ -89,7 +89,8 @@ def save_markets_toml(path: str | Path, entries: list[MarketEntry]) -> None:
         lines.append("[[markets]]")
         lines.append(f'slug_id       = "{_toml_escape(m.slug_id)}"')
         lines.append(f'slug          = "{_toml_escape(m.slug)}"')
-        lines.append(f'condition_id  = "{_toml_escape(m.condition_id)}"')
+        if m.condition_id:
+            lines.append(f'condition_id  = "{_toml_escape(m.condition_id)}"')
         lines.append(f"enabled       = {str(bool(m.enabled)).lower()}")
         lines.append(f'profile       = "{_toml_escape(m.profile)}"')
         lines.append(f"fv_initial    = {m.fv_initial:.6g}")

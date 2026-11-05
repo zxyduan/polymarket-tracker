@@ -31,27 +31,42 @@ class TraderAlertUsecase:
         self._cfg = config
         self._health = health
 
+    @property
+    def funnel(self) -> MutableMapping[str, Any]:
+        """暴露分发漏斗计数，供健康监控读取。"""
+        return self._health
+
     async def handle(self, event: Any) -> DeliveryResult:
+        for key in ("render_none", "dedup_hit", "dispatched", "dispatch_failed"):
+            self._health.setdefault(key, 0)
+
         msg = self._renderer.render(event)
         if msg is None:
+            self._health["render_none"] += 1
             logger.warning("trader: render 返回 None，跳过")
             return DeliveryResult(outcomes=())
 
         # body_hash 去重：同一正文已成功推过则跳过
         # 作用：防 RTDS + Data API 双源推送同一笔交易产生两条相同告警
         dedup_key = f"alert:{getattr(event, 'dedupe_key', '') or getattr(event, 'title', '')}"
-        if self._cfg.dedup and self._hash is not None:
+        dedup_enabled = bool(self._cfg and self._cfg.dedup)
+        if dedup_enabled and self._hash is not None:
             if await self._hash.matches("trader", dedup_key, msg.body):
-                logger.debug("trader: body_hash 命中，跳过重复推送 key=%s", dedup_key)
+                self._health["dedup_hit"] += 1
+                logger.info("trader: body_hash 去重命中，跳过重复推送 key=%s", dedup_key)
                 return DeliveryResult(outcomes=())
 
         result = await self._router.dispatch("trader", msg)
-        self._health["trader_failures"] = len(result.channel_failures)
-        if result.channel_failures:
-            logger.error("trader: %d 通道推送失败", len(result.channel_failures))
+        failures = len(result.channel_failures)
+        self._health["trader_failures"] = failures
+        if failures:
+            self._health["dispatch_failed"] += 1
+            logger.error("trader: %d 通道推送失败", failures)
+        else:
+            self._health["dispatched"] += 1
 
         # 仅全部通道无失败时才写指纹
-        if self._cfg.dedup and self._hash is not None and not result.channel_failures:
+        if dedup_enabled and self._hash is not None and failures == 0:
             await self._hash.record("trader", dedup_key, msg.body)
 
         return result

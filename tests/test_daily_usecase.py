@@ -146,3 +146,46 @@ def test_daily_degraded_partial_window():
     result, uc = _run(query=q)
     assert result == "degraded"
     assert uc._health["daily_result"] == "degraded"
+
+
+def test_daily_missing_markets_render_note():
+    from features.daily_report.renderer import DailyReportRenderer
+
+    renderer = DailyReportRenderer()
+    msg = renderer.render(
+        [{
+            "condition_id": "cid-a",
+            "slug_id": "a",
+            "shares_1d": 1.0,
+            "shares_3d": 2.0,
+            "shares_7d": 3.0,
+        }],
+        windows_days=[1, 3, 7],
+        now_bucket=100,
+        tz_offset_hours=8,
+        top_n=0,
+        missing_markets=["b", "c"],
+    )
+    assert msg is not None
+    assert "另有 2 个市场数据采集中：b、c" in msg.body
+
+    collecting = renderer.render(
+        [],
+        windows_days=[1, 3, 7],
+        now_bucket=100,
+        tz_offset_hours=8,
+        top_n=0,
+        missing_markets=["b"],
+    )
+    assert collecting is not None
+    assert "正在采集" in collecting.body
+
+    empty = renderer.render(
+        [],
+        windows_days=[1, 3, 7],
+        now_bucket=100,
+        tz_offset_hours=8,
+        top_n=0,
+        missing_markets=[],
+    )
+    assert empty is None

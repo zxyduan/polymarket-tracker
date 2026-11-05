@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -115,9 +116,14 @@ class SnapshotCollector:
                     if item is None:
                         continue
                 cid = item.get("conditionId")
+                outcomes = item.get("outcomes")
                 token_ids = _json_list(item.get("clobTokenIds"))
-                if cid and token_ids:
-                    result = (str(cid), str(token_ids[0]))
+                if isinstance(outcomes, list) and "Yes" in outcomes:
+                    yes_idx = outcomes.index("Yes")
+                else:
+                    yes_idx = 0
+                if cid and len(token_ids) > yes_idx:
+                    result = (str(cid), str(token_ids[yes_idx]))
                     self._resolved[slug] = result
                     return result
             except Exception as exc:  # noqa: BLE001 - 解析失败降级
@@ -495,7 +501,7 @@ class SnapshotCollector:
     # ── fetcher ──────────────────────────────────────────────────────
 
     async def fetch_live_prices(self, rows: list[dict[str, Any]]) -> dict[str, float]:
-        """推送前取每个市场 Gamma 最新价 → {condition_id: price}。
+        """推送前取每个市场 Gamma Yes 侧最新价 → {condition_id: price}。
 
         失败的市场降级跳过（渲染时回退 price_close）；单市场超时/报错
         不拖垮整次推送，逐个并发拉取。
@@ -503,6 +509,9 @@ class SnapshotCollector:
         cids = [str(r.get("condition_id") or "") for r in rows if r.get("condition_id")]
         if not cids:
             return {}
+        known_tokens = {
+            cid.lower(): token for cid, token in self._resolved.values()
+        }
 
         async def _one(cid: str) -> tuple[str, float | None]:
             try:
@@ -512,11 +521,27 @@ class SnapshotCollector:
                 r.raise_for_status()
                 data = r.json()
                 if not data:
+                    logger.warning("snap_live_price_missing cid=%s", cid[:8])
                     return (cid, None)
-                price = data[0].get("price")
-                if price is None:
+                item = data[0]
+                outcomes = item.get("outcomes")
+                prices = _json_list(item.get("outcomePrices"))
+                token_ids = _json_list(item.get("clobTokenIds"))
+                if not isinstance(outcomes, list) or "Yes" not in outcomes:
+                    logger.warning("snap_live_price_skip cid=%s outcomes=%r", cid[:8], outcomes)
                     return (cid, None)
-                return (cid, float(price))
+                yes_idx = outcomes.index("Yes")
+                if yes_idx >= len(prices) or yes_idx >= len(token_ids):
+                    logger.warning("snap_live_price_skip cid=%s 缺少 Yes 价格或 token", cid[:8])
+                    return (cid, None)
+                expected_token = known_tokens.get(cid.lower())
+                if expected_token and str(token_ids[yes_idx]) != expected_token:
+                    logger.warning(
+                        "snap_live_price_skip cid=%s Yes token 不一致 expected=%s actual=%s",
+                        cid[:8], expected_token[:12], str(token_ids[yes_idx])[:12],
+                    )
+                    return (cid, None)
+                return (cid, float(prices[yes_idx]))
             except Exception as exc:  # noqa: BLE001 - 单市场失败降级
                 logger.warning("snap_live_price_failed cid=%s err=%s", cid[:8], exc)
                 return (cid, None)
@@ -582,8 +607,6 @@ def _json_list(value: Any) -> list[Any]:
         return []
     if isinstance(value, list):
         return value
-    import json
-
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, list) else []

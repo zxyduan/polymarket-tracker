@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any, Mapping, MutableMapping, Protocol
@@ -34,6 +35,7 @@ class DailyReportConfig:
     page_size: int = 30
     dedup: bool = True
     now_bucket: int = 0
+    bucket_seconds: int = 7200
 
 
 class DailyReportUsecase:
@@ -59,6 +61,8 @@ class DailyReportUsecase:
 
     async def run(self) -> str:
         R = self._cfg.now_bucket
+        if not R:
+            R = (int(time.time()) // self._cfg.bucket_seconds) * self._cfg.bucket_seconds
         windows = self._cfg.windows_days
 
         # 1) windows_sum 聚合
@@ -76,16 +80,23 @@ class DailyReportUsecase:
             for row in rows:
                 agg.setdefault(row.condition_id.lower(), {})[d] = row.shares or 0.0
 
-        # 2) 合并行
-        out: list[dict] = []
+        # 2) 合并行：无 cid 或窗口无桶的市场不进入份额表，仅在末尾注明。
+        out: list[dict[str, Any]] = []
+        missing: list[str] = []
         for m in self._catalog.markets():
             cid = (getattr(m, "condition_id", "") or "").lower()
+            label = str(
+                getattr(m, "slug_id", "") or getattr(m, "slug", "") or cid[:10]
+            )
             if not cid or cid not in agg:
+                if label and label not in missing:
+                    missing.append(label)
                 continue
-            row = {"condition_id": cid}
+            row: dict[str, Any] = {"condition_id": cid, "slug_id": label}
             for d in windows:
                 row[f"shares_{d}d"] = max(0.0, agg[cid].get(d, 0.0))
             out.append(row)
+        self._health["missing_markets"] = len(missing)
 
         # 3) 单调自检（仅全部窗口成功时）
         if failed == 0:
@@ -97,8 +108,12 @@ class DailyReportUsecase:
 
         # 4) 渲染
         msg = self._renderer.render(
-            out, windows_days=windows, now_bucket=R,
-            tz_offset_hours=self._cfg.timezone_offset_hours, top_n=self._cfg.top_n,
+            out,
+            windows_days=windows,
+            now_bucket=R,
+            tz_offset_hours=self._cfg.timezone_offset_hours,
+            top_n=self._cfg.top_n,
+            missing_markets=missing,
         )
         if msg is None:
             self._health["daily_result"] = "empty"

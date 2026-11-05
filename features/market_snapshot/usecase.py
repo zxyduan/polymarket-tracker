@@ -8,8 +8,9 @@ send_failed 只看通道异常或无通道；成功才写指纹。
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, MutableMapping, Protocol
+from typing import Any, Literal, Mapping, MutableMapping, Protocol
 
 from framework.delivery.router import ChannelRouter
 from framework.models.message import RenderedMessage
@@ -18,6 +19,10 @@ from framework.scheduler.guard import BodyHashGuard
 from features.market_snapshot.ports import SnapshotCollectorPort, SnapshotRenderer
 
 logger = logging.getLogger(__name__)
+
+PushStatus = Literal[
+    "sent", "send_failed", "dedup_skip", "empty", "stale_skip", "render_none"
+]
 
 
 class MarketCatalog(Protocol):
@@ -54,8 +59,21 @@ class SnapshotPushUsecase:
         self._cfg = config
         self._health = health
 
-    async def run(self) -> None:
-        now_bucket = self._cfg.now_bucket or 0
+    async def run(self) -> PushStatus:
+        now_bucket = self._cfg.now_bucket
+        if not now_bucket:
+            now_bucket = (
+                int(time.time()) // self._cfg.bucket_seconds
+            ) * self._cfg.bucket_seconds
+
+        for key in (
+            "empty_skipped",
+            "stale_skipped",
+            "dedup_skipped",
+            "render_none",
+            "send_failures",
+        ):
+            self._health.setdefault(key, 0)
 
         # 1) 逐市场解析 cid，失败跳过
         cids: list[str] = []
@@ -78,14 +96,16 @@ class SnapshotPushUsecase:
 
         # 3) 最新完整桶
         rows = await self._query.latest_complete_buckets(now_bucket)
+        self._health["last_rows"] = len(rows)
 
-        # 4) 无数据直接返回（调度器仍写 state）
+        # 4) 无数据：不写成功 state，避免调度层误判“已推送”
         if not rows:
-            return
+            self._health["empty_skipped"] += 1
+            logger.info("快照跳过：无完整桶数据 bucket=%s", now_bucket)
+            return "empty"
 
         # 5) 陈旧守卫：最新闭合桶落后 max_stale_buckets 个桶则跳过推送
         #    避免采集中断后，整点仍照常推送过时数据误导用户
-        self._health["last_rows"] = len(rows)
         if self._cfg.max_stale_buckets > 0 and now_bucket:
             latest_bucket = max(int(r.get("bucket_ts", 0)) for r in rows)
             lag_buckets = (now_bucket - latest_bucket) // self._cfg.bucket_seconds
@@ -94,8 +114,9 @@ class SnapshotPushUsecase:
                     "快照陈旧守卫触发：最新桶落后 %d 个桶（阈值 %d），跳过本次推送",
                     lag_buckets, self._cfg.max_stale_buckets,
                 )
-                self._health["stale_skipped"] = lag_buckets
-                return
+                self._health["stale_skipped"] += 1
+                self._health["last_stale_lag"] = lag_buckets
+                return "stale_skip"
 
         # 6) 实时价
         try:
@@ -107,17 +128,31 @@ class SnapshotPushUsecase:
         # 8) 渲染
         msg = self._renderer.render(rows, live_prices=live, now_bucket=now_bucket)
         if msg is None:
-            return
+            self._health["render_none"] += 1
+            logger.warning("快照渲染为空，跳过 bucket=%s", now_bucket)
+            return "render_none"
 
-        # 9) dedup 开启才读指纹（S-01）
+        # 9) dedup 开启才读指纹（S-01）；抑制由循环层另写 snap_skip:*
         if self._cfg.dedup:
             if await self._hash.matches("snapshot", f"push:{now_bucket}", msg.body):
-                return
+                self._health["dedup_skipped"] += 1
+                logger.info("快照正文未变化，去重抑制 bucket=%s", now_bucket)
+                return "dedup_skip"
 
         # 10) 逐通道分发；send_failed = 通道失败或无通道
         result = await self._router.dispatch("market_snapshot", msg)
         send_failed = bool(result.channel_failures) or result.configured_channels == 0
         self._health["send_failed"] = send_failed
+        if send_failed:
+            self._health["send_failures"] += 1
+            logger.error(
+                "快照分发失败 configured=%d failures=%d",
+                result.configured_channels, len(result.channel_failures),
+            )
+            return "send_failed"
 
-        if self._cfg.dedup and not send_failed:
+        self._health["last_push_ts"] = int(time.time())
+        self._health["last_push_bucket"] = now_bucket
+        if self._cfg.dedup:
             await self._hash.record("snapshot", f"push:{now_bucket}", msg.body)
+        return "sent"

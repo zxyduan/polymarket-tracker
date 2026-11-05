@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from dataclasses import replace
 from typing import Any
 
 from dotenv import load_dotenv
@@ -19,8 +20,8 @@ from framework.models.event import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
 from src.notify import Notifier, build_notifiers
-from src.settings import Settings, resolve_daily_config
-from src.snapshots.collector import SnapshotCollector, _current_bucket_start
+from src.settings import MarketEntry, Settings, resolve_daily_config
+from src.snapshots.collector import SnapshotCollector
 from src.snapshots.commands import DailyCommandHandler, SnapshotCommandHandler
 from src.sources.data_api_client import DataApiClient
 from src.sources.gamma_client import GammaClient
@@ -31,6 +32,7 @@ from src.utils.retry import backoff_delay
 
 from framework.runtime.loops import (
     daily_report_loop,
+    funnel_watch_loop,
     heartbeat_writer,
     health_watcher,
     prune_loop,
@@ -119,6 +121,7 @@ async def build_app(config_path: str) -> AppHandle:
     pipeline = PipelineRunner(event_queue, message_queue, storage, gamma, settings)
     h.pipeline = pipeline
     health: dict[str, Any] = {"rtds_connected": False, "l2_last_run": "-"}
+    health["pipeline_funnel"] = pipeline.funnel
 
     # ── 市场快照 ──
     snapshot_push_cfg = settings.snapshot_push
@@ -136,6 +139,28 @@ async def build_app(config_path: str) -> AppHandle:
         price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
     )
     h.snap_collector = snap_collector
+
+    # 方案 B：日报需要 condition_id；配置未填时启动按 slug 自动解析，
+    # 快照采集循环仍自行解析，这里只补充日报 Catalog 使用的只读副本。
+    resolved_markets: list[MarketEntry] = []
+    unresolved: list[str] = []
+    for m in markets:
+        cid = (m.condition_id or "").strip()
+        if not cid:
+            try:
+                resolved = await snap_collector.resolve_market(m.slug)
+            except Exception as exc:  # noqa: BLE001 - 单市场失败不阻断启动
+                logger.warning("市场 cid 自动解析失败 %s: %s", m.slug_id, exc)
+                resolved = None
+            cid = resolved[0] if resolved else ""
+        if cid:
+            resolved_markets.append(replace(m, condition_id=cid))
+        else:
+            unresolved.append(m.slug_id)
+            resolved_markets.append(m)
+    if unresolved:
+        logger.warning("以下市场未解析到 condition_id，日报将跳过: %s", ", ".join(unresolved))
+
     snap_health: dict[str, Any] = {"snap_last_push": "-"}
     collect_state: dict[str, float] = {"round_done_ts": 0.0}
     snap_notifiers: list[Notifier] = []
@@ -188,11 +213,11 @@ async def build_app(config_path: str) -> AppHandle:
     if not daily_cfg.enabled:
         logger.info("daily_report 未启用或配置存在致命错误，日报任务不注册")
 
-    async def trigger_snapshot_push() -> None:
+    async def trigger_snapshot_push() -> str:
         if "snap" in p1:
-            await p1["snap"]()
-            return
+            return await p1["snap"]()
         logger.error("快照推送 usecase 未装配")
+        return "send_failed"
 
     async def trigger_snapshot_now() -> None:
         await _snapshot_collect_round(snap_collector, markets)
@@ -315,8 +340,12 @@ async def build_app(config_path: str) -> AppHandle:
     from features.daily_report.usecase import DailyReportConfig
 
     class _Catalog:
-        def slugs(self): return [m.slug for m in markets]
+        def slugs(self): return [m.slug for m in resolved_markets]
 
+        def markets(self): return list(resolved_markets)
+
+    snap_max_stale = int(snapshot_push_cfg.get("max_stale_buckets", 24))
+    logger.info("快照陈旧守卫阈值=%d 桶（0=不启用）", snap_max_stale)
     _rt, _trader_uc = build_runtime(
         storage=storage, collector=snap_collector, catalog=_Catalog(),
         snap_notifiers=snap_notifiers, daily_notifiers=daily_notifiers,
@@ -329,21 +358,29 @@ async def build_app(config_path: str) -> AppHandle:
         trader_renderer=LegacyTraderRenderer(),
         snap_cfg=SnapshotPushConfig(
             dedup=bool(snapshot_push_cfg.get("dedup", True)),
-            now_bucket=_current_bucket_start(),
+            max_stale_buckets=snap_max_stale,
+            now_bucket=0,
             bucket_seconds=int(snapshot_cfg.get("bucket_seconds", 7200)),
         ),
         daily_cfg=DailyReportConfig(
             windows_days=list(daily_cfg.windows_days),
             timezone_offset_hours=daily_cfg.timezone_offset_hours,
             top_n=daily_cfg.top_n, page_size=daily_cfg.page_size,
-            now_bucket=_current_bucket_start(),
+            now_bucket=0,
+            bucket_seconds=int(daily_cfg.bucket_seconds),
         ),
         snap_health=snap_health, daily_health=daily_health,
     )
     p1["snap"] = next(m.run for m in _rt.modules if m.name == "market_snapshot")
     p1["daily"] = next(m.run for m in _rt.modules if m.name == "daily_report")
     p1["trader"] = _trader_uc
+    health["trader_funnel"] = _trader_uc.funnel
     logger.info("三个 feature 已接管")
+    logger.info("交易漏斗基线 pipeline=%s trader=%s", pipeline.funnel, _trader_uc.funnel)
+    tasks.append(asyncio.create_task(supervised(
+        "funnel_watch",
+        lambda: funnel_watch_loop(pipeline, _trader_uc, stop_event),
+        stop_event)))
 
     # 信号处理
     loop = asyncio.get_running_loop()

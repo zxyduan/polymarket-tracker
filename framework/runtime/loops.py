@@ -55,6 +55,24 @@ async def health_watcher(
             pass
 
 
+async def funnel_watch_loop(
+    pipeline: Any,
+    trader: Any,
+    stop_event: asyncio.Event,
+    interval_seconds: int = 300,
+) -> None:
+    """周期输出交易漏斗；ntfy-only 部署下 Telegram /status 不可用。"""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            logger.info(
+                "交易漏斗 pipeline=%s trader=%s",
+                pipeline.funnel,
+                trader.funnel,
+            )
+
+
 async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.Event) -> None:
     """每日清理：过期事件、过期推送记录、过期快照，并 VACUUM 回收文件空间。"""
     events_days = int(settings.get("events.retention_days", 180))
@@ -178,15 +196,27 @@ async def snapshot_push_loop(
                 continue
             date_key = now_bj.strftime("%Y-%m-%d")
             state_key = f"snap_push:{date_key}:{label}"
-            if await storage.get_state(state_key):
+            skip_key = f"snap_skip:{date_key}:{label}"
+            if await storage.get_state(state_key) or await storage.get_state(skip_key):
                 continue
             try:
-                await trigger_push()
+                result = await trigger_push()
             except Exception as exc:  # noqa: BLE001
                 logger.error("整点推送失败 %s: %s", label, exc)
+                pushed_any = True
                 continue
-            await storage.set_state(state_key, "1")
-            logger.info("整点快照已推送: %s %s", date_key, label)
+            if result == "sent":
+                await storage.set_state(state_key, "1")
+                logger.info("整点快照已推送: %s %s", date_key, label)
+            elif result == "dedup_skip":
+                await storage.set_state(skip_key, "1")
+                logger.info("快照正文未变化，去重抑制: %s %s", date_key, label)
+            elif result in ("empty", "stale_skip", "render_none"):
+                logger.warning(
+                    "快照未发送 result=%s: %s %s", result, date_key, label
+                )
+            else:
+                logger.error("快照推送失败 result=%s: %s %s", result, date_key, label)
             pushed_any = True
         if pushed_any:
             await asyncio.sleep(60)

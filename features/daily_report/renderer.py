@@ -29,11 +29,32 @@ def _daily_index(i: int) -> str:
 class DailyReportRenderer:
     """日报渲染器：rows → RenderedMessage | None。"""
 
-    def render(self, rows: list[dict[str, Any]], *, windows_days: list[int],
-               now_bucket: int, tz_offset_hours: int,
-               top_n: int) -> RenderedMessage | None:
+    def render(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        windows_days: list[int],
+        now_bucket: int,
+        tz_offset_hours: int,
+        top_n: int,
+        missing_markets: list[str] | None = None,
+    ) -> RenderedMessage | None:
+        missing = list(missing_markets or [])
+
+        local_tz = timezone(timedelta(hours=tz_offset_hours))
+        r_local = datetime.fromtimestamp(now_bucket, tz=local_tz)
+        title = f"📈 每日成交份额汇总 · {r_local.month}月{r_local.day}日（截至今晨06:00）"
+
         if not rows:
-            return None
+            if not missing:
+                return None
+            body = "\n".join([
+                title,
+                "",
+                "以下市场暂无成交份额数据，正在采集：",
+                "、".join(missing),
+            ])
+            return RenderedMessage(body=body, title=title, event_keys=("daily_report",))
 
         primary = f"shares_{windows_days[0]}d"
         ordered = sorted(
@@ -48,10 +69,6 @@ class DailyReportRenderer:
             truncated_note = f"其余 {total - top_n} 个市场未列出"
         else:
             display = ordered
-
-        local_tz = timezone(timedelta(hours=tz_offset_hours))
-        r_local = datetime.fromtimestamp(now_bucket, tz=local_tz)
-        title = f"📈 每日成交份额汇总 · {r_local.month}月{r_local.day}日（截至今晨06:00）"
 
         market_lines: list[str] = []
         for i, row in enumerate(display, 1):
@@ -74,4 +91,6 @@ class DailyReportRenderer:
             body += "\n" + footer
         if truncated_note:
             body += "\n" + truncated_note
+        if missing:
+            body += f"\n另有 {len(missing)} 个市场数据采集中：" + "、".join(missing)
         return RenderedMessage(body=body, title=title, event_keys=("daily_report",))

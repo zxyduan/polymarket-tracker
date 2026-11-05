@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from framework.delivery.router import ChannelRouter, DeliveryResult
 from framework.models.message import RenderedMessage
@@ -61,19 +62,57 @@ def _build(**kw):
 
 def test_happy_path_records_hash():
     uc = _build()
-    asyncio.run(uc.run())
+    status = asyncio.run(uc.run())
+    assert status == "sent"
     assert uc._collector.backfilled == ["cid-a", "cid-b"]
     assert uc._hash.recorded == ["body-A"]
+    assert uc._health["dedup_skipped"] == 0
 
 
 def test_dedup_hit_skips():
     h = FakeHash(hits={"body-A"})
     uc = _build(hash=h)
-    asyncio.run(uc.run())
+    status = asyncio.run(uc.run())
+    assert status == "dedup_skip"
     assert h.recorded == []
+    assert uc._health["dedup_skipped"] == 1
 
 
 def test_empty_rows_early_return():
     uc = _build(query=FakeQuery([]))
-    asyncio.run(uc.run())
+    status = asyncio.run(uc.run())
+    assert status == "empty"
     assert uc._hash.recorded == []
+    assert uc._health["empty_skipped"] == 1
+
+
+def test_render_none_is_observable():
+    uc = _build(renderer=FakeRenderer(None))
+    status = asyncio.run(uc.run())
+    assert status == "render_none"
+    assert uc._health["render_none"] == 1
+    assert uc._hash.recorded == []
+
+
+class DynamicQuery(FakeQuery):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.seen_now = None
+
+    async def latest_complete_buckets(self, now_bucket):
+        self.seen_now = now_bucket
+        return self._rows
+
+
+def test_now_bucket_zero_uses_current_clock():
+    current_bucket = (int(time.time()) // 7200) * 7200
+    query = DynamicQuery([{"bucket_ts": current_bucket - 7200}])
+    uc = _build(
+        query=query,
+        config=SnapshotPushConfig(dedup=False, now_bucket=0, bucket_seconds=7200),
+    )
+    status = asyncio.run(uc.run())
+    assert status == "sent"
+    assert query.seen_now is not None
+    assert query.seen_now % 7200 == 0
+    assert uc._health["last_push_bucket"] == query.seen_now

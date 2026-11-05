@@ -176,9 +176,11 @@ def test_f2_stale_guard_skips_push():
         health={},
     )
 
-    asyncio.run(uc.run())
+    status = asyncio.run(uc.run())
+    assert status == "stale_skip"
     assert h.recorded == []  # 陈旧守卫触发，提前 return，没走到 dispatch/record
-    assert uc._health.get("stale_skipped") == 25
+    assert uc._health["stale_skipped"] == 1
+    assert uc._health["last_stale_lag"] == 25
 
 
 def test_f2_normal_lag_pushes_ok():

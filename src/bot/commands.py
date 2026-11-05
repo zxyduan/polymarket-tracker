@@ -92,11 +92,25 @@ class CommandHandler:
         latest = await self.storage.latest_event_time()
         rtds = "🟢 已连接" if self.health.get("rtds_connected") else "🔴 未连接"
         l2 = self.health.get("l2_last_run", "-")
+        pipeline_funnel = self.health.get("pipeline_funnel") or {}
+        trader_funnel = self.health.get("trader_funnel") or {}
+        funnel = (
+            f"漏斗：冲突 {pipeline_funnel.get('insert_conflict', 0)}｜"
+            f"类型拦截 {pipeline_funnel.get('type_blocked', 0)}｜"
+            f"金额不足 {pipeline_funnel.get('notional_below', 0)}｜"
+            f"金额缺失 {pipeline_funnel.get('notional_none', 0)}｜"
+            f"入聚合 {pipeline_funnel.get('accepted', 0)}；"
+            f"已分发 {trader_funnel.get('dispatched', 0)}｜"
+            f"去重 {trader_funnel.get('dedup_hit', 0)}｜"
+            f"渲染空 {trader_funnel.get('render_none', 0)}｜"
+            f"失败 {trader_funnel.get('dispatch_failed', 0)}"
+        )
         return (
             "<b>运行状态</b>\n"
             f"RTDS 实时通道：{rtds}\n"
             f"最近对账：{l2}\n"
             f"监控地址数：{len(wallets)}\n"
             f"今日推送：{notified} 条\n"
-            f"最近事件：{latest or '-'}"
+            f"最近事件：{latest or '-'}\n"
+            + funnel
         )

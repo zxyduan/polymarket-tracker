@@ -102,6 +102,13 @@ class PipelineRunner:
                 "endpoints.polygonscan", "https://polygonscan.com"
             ),
         )
+        self.funnel: dict[str, int] = {
+            "insert_conflict": 0,
+            "type_blocked": 0,
+            "notional_none": 0,
+            "notional_below": 0,
+            "accepted": 0,
+        }
 
     async def run(self) -> None:
         cfg = self.settings.section("filters")
@@ -151,17 +158,24 @@ class PipelineRunner:
             try:
                 inserted = await self.storage.insert_event(event)
                 if not inserted:
+                    self.funnel["insert_conflict"] += 1
                     continue
                 if event.event_type not in allowed_types:
+                    self.funnel["type_blocked"] += 1
                     continue
-                if (
-                    event.event_type == "TRADE"
-                    and event.notional is not None
-                    and event.notional < min_notional
-                ):
-                    continue
+                if event.event_type == "TRADE":
+                    if event.notional is None:
+                        self.funnel["notional_none"] += 1
+                        logger.warning(
+                            "TRADE 缺少 notional，默认拒绝 key=%s", event.dedupe_key
+                        )
+                        continue
+                    if event.notional < min_notional:
+                        self.funnel["notional_below"] += 1
+                        continue
                 if event.wallet not in label_map:
                     label_map.update(await load_labels(self.storage))
+                self.funnel["accepted"] += 1
                 await self.aggregator.add(event)
             finally:
                 self.in_queue.task_done()

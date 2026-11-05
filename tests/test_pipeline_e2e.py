@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,53 @@ async def test_end_to_end_aggregation(
     # 重复投递同一事件不会再产生消息
     await in_q.put(maker[0])
     assert out_q.empty()
+
+    await runner.shutdown()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_trade_funnel_counts_missing_below_and_accepted(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(str(tmp_path / "funnel.db"))
+    await storage.init()
+    await storage.add_wallet(s.W2, "交易员B")
+
+    class StrictSettings(FakeSettings):
+        def __init__(self) -> None:
+            super().__init__()
+            self._raw["filters"]["min_notional_usd"] = 2
+
+    class _Gamma:
+        async def get_market(self, _storage: Any, _cid: str) -> tuple[None, None]:
+            return None, None
+
+    in_q: asyncio.Queue[StandardEvent] = asyncio.Queue()
+    out_q: asyncio.Queue[Any] = asyncio.Queue()
+    runner = PipelineRunner(in_q, out_q, storage, _Gamma(), StrictSettings())
+    task = asyncio.create_task(runner.run())
+
+    def make_event(key: str, notional: Decimal | None) -> StandardEvent:
+        return StandardEvent(
+            dedupe_key=key,
+            source="test",
+            wallet=s.W2,
+            event_type="TRADE",
+            notional=notional,
+            condition_id="0xcid",
+            side="BUY",
+            outcome="Yes",
+        )
+
+    await in_q.put(make_event("none-key", None))
+    await in_q.put(make_event("below-key", Decimal("1.50")))
+    await in_q.put(make_event("accept-key", Decimal("2.00")))
+    await asyncio.sleep(0.4)
+
+    assert runner.funnel["notional_none"] == 1
+    assert runner.funnel["notional_below"] == 1
+    assert runner.funnel["accepted"] == 1
 
     await runner.shutdown()
     task.cancel()

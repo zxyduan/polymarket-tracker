@@ -406,3 +406,58 @@ async def test_collect_recovers_missed_buckets_after_sparse_boundary(
     # B0 为启动中途桶，起点基线确实拿不到，诚实保持未知（而非假 0）
     assert rows[b0]["volume_shares"] == -1.0
     assert await storage.get_snap_baseline("0xcid", b0) is None
+
+
+async def test_fetch_live_prices_uses_yes_index() -> None:
+    routes = {
+        "/markets": FakeResponse(
+            [
+                {
+                    "conditionId": "0xcid",
+                    "outcomes": ["No", "Yes"],
+                    "outcomePrices": ["0.9675", "0.0325"],
+                    "clobTokenIds": ["no-token", "yes-token"],
+                }
+            ]
+        )
+    }
+    collector = SnapshotCollector(None)  # type: ignore[arg-type]
+    collector._gamma = FakeAsyncClient("https://gamma", routes)  # type: ignore[assignment]
+    collector._resolved = {"slug-a": ("0xcid", "yes-token")}
+    prices = await collector.fetch_live_prices([{"condition_id": "0xcid"}])
+    assert prices == {"0xcid": 0.0325}
+
+
+async def test_fetch_live_prices_skips_token_mismatch() -> None:
+    routes = {
+        "/markets": FakeResponse(
+            [
+                {
+                    "conditionId": "0xcid",
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": ["0.0325", "0.9675"],
+                    "clobTokenIds": ["yes-token", "no-token"],
+                }
+            ]
+        )
+    }
+    collector = SnapshotCollector(None)  # type: ignore[arg-type]
+    collector._gamma = FakeAsyncClient("https://gamma", routes)  # type: ignore[assignment]
+    collector._resolved = {"slug-a": ("0xcid", "other-token")}
+    prices = await collector.fetch_live_prices([{"condition_id": "0xcid"}])
+    assert prices == {}
+
+
+async def test_resolve_market_prefers_yes_token() -> None:
+    routes = {
+        "/markets/slug/slug-a": FakeResponse(
+            {
+                "conditionId": "0xcid",
+                "outcomes": ["No", "Yes"],
+                "clobTokenIds": ["no-token", "yes-token"],
+            }
+        )
+    }
+    collector = SnapshotCollector(None)  # type: ignore[arg-type]
+    collector._gamma = FakeAsyncClient("https://gamma", routes)  # type: ignore[assignment]
+    assert await collector.resolve_market("slug-a") == ("0xcid", "yes-token")
