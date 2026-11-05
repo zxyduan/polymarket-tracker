@@ -17,11 +17,46 @@ EXPECTED_HEADS=("462fbe0" "c8c3017")
 PASS_N=0
 WARN_N=0
 FAIL_N=0
+WARN_ITEMS=()
+FAIL_ITEMS=()
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[31m'
+  YELLOW=$'\033[33m'
+  GREEN=$'\033[32m'
+  BOLD=$'\033[1m'
+  RESET=$'\033[0m'
+else
+  RED=""
+  YELLOW=""
+  GREEN=""
+  BOLD=""
+  RESET=""
+fi
 
 section() { printf '\n===== %s =====\n' "$1"; }
-ok()   { printf '[OK]   %s\n' "$1"; PASS_N=$((PASS_N + 1)); }
-warn() { printf '[WARN] %s\n' "$1"; WARN_N=$((WARN_N + 1)); }
-fail() { printf '[FAIL] %s\n' "$1"; FAIL_N=$((FAIL_N + 1)); }
+ok()   { printf '%s[OK]%s   %s\n' "$GREEN" "$RESET" "$1"; PASS_N=$((PASS_N + 1)); }
+warn() {
+  printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$1"
+  WARN_N=$((WARN_N + 1))
+  WARN_ITEMS+=("$1")
+}
+fail() {
+  printf '%s[FAIL]%s %s\n' "$RED" "$RESET" "$1"
+  FAIL_N=$((FAIL_N + 1))
+  FAIL_ITEMS+=("$1")
+}
+add_hint() {
+  local item="$1"
+  case "$item" in
+    *RTDS*) echo "    建议：检查 journalctl 中 RTDS 连接、订阅与重连记录" ;;
+    *通道*) echo "    建议：检查 config/config.yaml 对应通道 enabled 与 ntfy target" ;;
+    *漏斗*) echo "    建议：等待第一个统计周期；仍无则检查 funnel_watch_loop 日志" ;;
+    *数据库不存在*) echo "    建议：非 EC2 环境可忽略；EC2 上必须检查 data/monitor.db" ;;
+    *未跟踪*) echo "    建议：bash docs/cleanup-working-tree.sh 归档临时补丁/重复脚本" ;;
+    *未提交修改*) echo "    建议：git status 核对源码改动，确认后提交或 stash" ;;
+  esac
+}
 
 if [[ ! -d "$REPO" ]]; then
   echo "仓库目录不存在: $REPO"
@@ -64,9 +99,22 @@ for expected in "${EXPECTED_HEADS[@]}"; do
 done
 [[ "$HEAD_MATCH" -eq 1 ]] && ok "HEAD 与已接受修复提交一致" || warn "HEAD 不在 $EXPECTED_JOINED 列表内，请确认部署版本"
 echo "--- git status ---"
-git status --short || true
-echo "--- 根目录未跟踪项说明（docs/ 默认被 .gitignore 忽略，仅本地保留）---"
-git status --short | awk '$1 == "??" {print}' || true
+GIT_STATUS_OUTPUT=$(git status --short || true)
+printf '%s\n' "$GIT_STATUS_OUTPUT"
+UNTRACKED_LINES=$(printf '%s\n' "$GIT_STATUS_OUTPUT" | awk '$1 == "??" {print}')
+MODIFIED_LINES=$(printf '%s\n' "$GIT_STATUS_OUTPUT" | grep -E '^(M|A|D|MM|AM|MA| M| A| D)' || true)
+if [[ -n "$UNTRACKED_LINES" ]]; then
+  warn "存在根目录未跟踪文件/脚本，建议运行 docs/cleanup-working-tree.sh 归档"
+  printf '%s\n' "$UNTRACKED_LINES" | sed 's/^/    untracked: /'
+else
+  ok "无未跟踪文件"
+fi
+if [[ -n "$MODIFIED_LINES" ]]; then
+  warn "工作树存在未提交修改，请确认是否需要提交"
+  printf '%s\n' "$MODIFIED_LINES" | sed 's/^/    modified: /'
+else
+  ok "工作树无未提交源码修改"
+fi
 
 section "2. 关键修复代码标记"
 check_marker() {
@@ -165,7 +213,8 @@ else
 fi
 
 section "6. 数据库只读对账（DB 累计值，不等同于进程内存计数）"
-DB_PATH="$DB_PATH" "$PY" - <<'PY'
+DB_REPORT=$(mktemp)
+DB_PATH="$DB_PATH" "$PY" - <<'PY' | tee "$DB_REPORT"
 import json
 import os
 import sqlite3
@@ -174,7 +223,7 @@ from datetime import datetime, timezone
 
 db = os.environ.get("DB_PATH", "")
 if not db or not os.path.exists(db):
-    print("WARN: 数据库不存在，跳过 DB 检查")
+    print("SELF_CHECK_WARN: 数据库不存在，跳过 DB 检查")
     sys.exit(0)
 
 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -290,6 +339,13 @@ try:
             (f"{tx}:%",),
         )
         print(f"{label}: events={len(events)} success_notifications={len(notifications)}")
+        is_historical_gap = label.startswith("Base")
+        if len(events) == 0:
+            marker = "SELF_CHECK_WARN" if is_historical_gap else "SELF_CHECK_FAIL"
+            print(f"{marker}: {label} 未在 events 表定位到")
+        if len(notifications) == 0:
+            marker = "SELF_CHECK_WARN" if is_historical_gap else "SELF_CHECK_FAIL"
+            print(f"{marker}: {label} 没有 success 通知记录")
         for r in events[:3]:
             print(f"  event: {r['observed_at']} {r['source']} notional={r['notional']} key={r['dedupe_key']}")
         for r in notifications[:3]:
@@ -302,6 +358,8 @@ try:
         print(f"status={r['status'] or '-':<8} count={r['c']}")
     non_success = sum(int(r["c"]) for r in status_rows if (r["status"] or "") != "success")
     print(f"non_success_total={non_success}")
+    if non_success > 0:
+        print(f"SELF_CHECK_FAIL: 存在 {non_success} 条非 success 通知，请检查分发失败或被拒绝记录")
 
     print("\n-- 最近 15 条成交：门槛分支与通知覆盖 --")
     print("口径：notional 是单笔原始成交；notified=YES 表示 notifications.event_keys 精确包含该 dedupe_key。")
@@ -373,8 +431,15 @@ try:
         print(f"bucket={r['bucket_ts']} slug={r['slug_id']:<8} price_close={r['price_close']:.4f} "
               f"volume_shares={r['volume_shares']} collected={ts}")
 except sqlite3.Error as exc:
-    print(f"WARN: SQLite 查询失败: {exc}")
+    print(f"SELF_CHECK_WARN: SQLite 查询失败: {exc}")
 PY
+while IFS= read -r db_line; do
+  case "$db_line" in
+    "SELF_CHECK_FAIL:"*) fail "${db_line#SELF_CHECK_FAIL: }" ;;
+    "SELF_CHECK_WARN:"*) warn "${db_line#SELF_CHECK_WARN: }" ;;
+  esac
+done < "$DB_REPORT"
+rm -f "$DB_REPORT"
 
 section "7. 建议人工复核命令"
 cat <<'EOF'
@@ -394,14 +459,32 @@ bash docs/cleanup-working-tree.sh
 sqlite3 data/monitor.db "SELECT key,value,updated_at FROM sync_state WHERE key LIKE 'snap_%' ORDER BY updated_at DESC LIMIT 20;"
 EOF
 
-printf '\n===== 结论 =====\n'
+printf '\n===== 结论汇总 =====\n'
 if [[ "$FAIL_N" -gt 0 ]]; then
-  printf 'FAIL: %d 个失败项, %d 个警告项\n' "$FAIL_N" "$WARN_N"
+  printf '%s%sFAIL: %d 个失败项, %d 个警告项, %d 个通过项%s\n' \
+    "$RED" "$BOLD" "$FAIL_N" "$WARN_N" "$PASS_N" "$RESET"
+  printf '%s判定：存在阻断性失败项，不建议判定为当前服务正常。%s\n\n' "$RED" "$RESET"
+  printf '%s-- 必须处理：失败项清单 --%s\n' "$BOLD" "$RESET"
+  for i in "${!FAIL_ITEMS[@]}"; do
+    printf '%s%2d) FAIL%s %s\n' "$RED" "$((i + 1))" "$RESET" "${FAIL_ITEMS[$i]}"
+    add_hint "${FAIL_ITEMS[$i]}"
+  done
   exit 1
-elif [[ "$WARN_N" -gt 0 ]]; then
-  printf 'WARN: %d 个警告项, %d 个通过项；服务可能可用但存在待观察点\n' "$WARN_N" "$PASS_N"
-  exit 0
-else
-  printf 'PASS: %d 个检查项通过\n' "$PASS_N"
+fi
+
+if [[ "$WARN_N" -gt 0 ]]; then
+  printf '%s%sWARN: %d 个警告项, %d 个通过项%s\n' \
+    "$YELLOW" "$BOLD" "$WARN_N" "$PASS_N" "$RESET"
+  printf '%s判定：主流程可能可用，但下面警告项需要观察或人工复核。%s\n\n' "$YELLOW" "$RESET"
+  printf '%s-- 待观察：警告项清单 --%s\n' "$BOLD" "$RESET"
+  for i in "${!WARN_ITEMS[@]}"; do
+    printf '%s%2d) WARN%s %s\n' "$YELLOW" "$((i + 1))" "$RESET" "${WARN_ITEMS[$i]}"
+    add_hint "${WARN_ITEMS[$i]}"
+  done
+  printf '\n提示：黄色 WARN 不等于功能失败；红色 FAIL 才是必须先处理的阻断项。\n'
   exit 0
 fi
+
+printf '%sPASS: %d 个检查项全部通过%s\n' "$GREEN" "$PASS_N" "$RESET"
+printf '%s判定：未发现阻断性失败项和警告项。%s\n' "$GREEN" "$RESET"
+exit 0
