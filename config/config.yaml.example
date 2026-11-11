@@ -87,6 +87,56 @@ daily_report:
   page_size: 20
   dedup: true
 
+# 每日市场筛选：采集轮每日定时拉取公开 Gamma 市场，按时间-概率档位落库；
+# P1 只落库表/视图，不做展示页；只读二次筛选直接查库。
+market_screen:
+  enabled: true
+  schedule: "08:00"              # 每日采集时刻（HH:MM，24h 制）
+  timezone_offset_hours: 8
+  retry_seconds: 5               # 命中分钟内失败重试间隔（秒）
+  retention_days: 30              # 筛选候选保留天数
+
+  volume:
+    metric: "volume24hr"          # USDC 名义成交额口径（P1 仅此一种）
+    min_value: 50000.0           # 24h 成交额下限（USDC）
+    top_n: 200                   # 按 24h 量倒序截断的候选上限
+    page_limit: 100              # Gamma 分页大小
+    max_pages: 4                 # 最多翻页数（4×100=400 候选上限）
+    request_timeout_seconds: 10  # 单页 HTTP 超时
+    retry_attempts: 2            # 网络错误/429/5xx 透明重试次数；4xx（除 429）不重试
+    retry_backoff_seconds: 1.0   # 指数退避基数秒数
+    page_delay_seconds: 0.2      # 串行翻页间隔
+
+  horizon_prob:
+    enabled: true                # 概率×到期时间规则总开关；false=只做量阈值+TopN
+    preset: "balanced"           # 主档 strict | balanced | loose（passed_count 按主档统计）
+    record_all_presets: true      # 并行记录三档标志；false 仅主档计算，其余留 NULL
+    mode: "anchor_linear"       # P1 仅 anchor_linear；formula 预留 P2
+    # anchors: []                 # 非空单组列表整体覆盖主档模板；须 days 升序、minority_max∈(0,0.5)
+    # anchors:
+    #   - { days: 30, minority_max: 0.01 }
+    #   - { days: 60, minority_max: 0.02 }
+    #   - { days: 365, minority_max: 0.10 }
+    clamp_min: 0.002
+    clamp_max: 0.20
+
+  binary_only: true              # 仅 Yes/No 二元市场
+  persist_non_passed: true       # 未过主档候选也落库（持续性主场景依赖候选池历史）
+
+  query_defaults:                 # 持续性只读查询默认参数（门面未显式传入时回落）
+    window_days: 10
+    min_hit_days: 10
+    require_consecutive: false
+    min_volume_24h: 50000.0
+    max_rank: 200
+    min_remaining_days: 31
+    prob_max: 0.15               # 小侧概率上限（主场景 ≤15%）
+    prob_side: "minority"        # minority | yes
+
+  notify:
+    enabled: false               # P1 不装配推送通道
+
+
 # 服务端点（集中配置，接口变更只改这里）
 endpoints:
   rtds: "wss://ws-live-data.polymarket.com"

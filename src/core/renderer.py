@@ -244,7 +244,7 @@ def render_digest(
         end = start + timedelta(seconds=span)
         lines.append(
             f"窗口 {start.strftime('%H:%M:%S')}–{end.strftime('%H:%M:%S')}"
-            "（时间）"
+            "（北京时间）"
         )
 
     # 按钮：仅 Polygonscan（最多 3 个不同 tx）；不放 polymarket 市场链接

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from framework.models.market_screen import CandidateMarket, ScreenRunMeta
 from src.core.models import StandardEvent
 from src.settings import WatchlistSeed
 
@@ -97,6 +99,278 @@ CREATE TABLE IF NOT EXISTS snap_volume_baseline (
     updated_ts   REAL NOT NULL,
     PRIMARY KEY (condition_id, bucket_ts)
 );
+
+CREATE TABLE IF NOT EXISTS market_screen_daily (
+    run_date        TEXT    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    rank_no         INTEGER NOT NULL DEFAULT 0,
+    slug            TEXT    NOT NULL DEFAULT '',
+    question        TEXT    NOT NULL DEFAULT '',
+    outcomes        TEXT    NOT NULL DEFAULT '',
+    end_date_iso    TEXT,
+    end_date_raw    TEXT    NOT NULL DEFAULT '',
+    remaining_days  INTEGER,
+    prob_yes        REAL,
+    prob_no         REAL,
+    minority_prob   REAL,
+    volume_24h      REAL    NOT NULL DEFAULT 0.0,
+    volume_metric   TEXT    NOT NULL DEFAULT 'volume24hr',
+    horizon_preset  TEXT    NOT NULL DEFAULT 'balanced',
+    threshold_lo    REAL,
+    horizon_pass    INTEGER NOT NULL DEFAULT 0,
+    pass_strict     INTEGER,
+    pass_balanced   INTEGER,
+    pass_loose      INTEGER,
+    screen_passed   INTEGER NOT NULL DEFAULT 0,
+    screen_reason   TEXT    NOT NULL DEFAULT '',
+    collected_ts    REAL    NOT NULL,
+    PRIMARY KEY (run_date, condition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mscreen_date_pass
+    ON market_screen_daily(run_date, screen_passed, volume_24h DESC);
+CREATE INDEX IF NOT EXISTS idx_mscreen_preset ON market_screen_daily(run_date, horizon_preset);
+CREATE INDEX IF NOT EXISTS idx_mscreen_date_time_prob
+    ON market_screen_daily(run_date, remaining_days, minority_prob);
+CREATE INDEX IF NOT EXISTS idx_mscreen_date_minor_vol
+    ON market_screen_daily(run_date, minority_prob, volume_24h DESC);
+CREATE INDEX IF NOT EXISTS idx_mscreen_cid_date
+    ON market_screen_daily(condition_id, run_date);
+CREATE INDEX IF NOT EXISTS idx_mscreen_cid_date_vol
+    ON market_screen_daily(condition_id, run_date, volume_24h, rank_no);
+
+CREATE TABLE IF NOT EXISTS market_screen_run (
+    run_date            TEXT PRIMARY KEY,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    elapsed_ms          INTEGER NOT NULL DEFAULT 0,
+    pages_fetched       INTEGER NOT NULL DEFAULT 0,
+    candidate_count     INTEGER NOT NULL DEFAULT 0,
+    horizon_preset      TEXT    NOT NULL DEFAULT 'balanced',
+    pass_strict_count   INTEGER NOT NULL DEFAULT 0,
+    pass_balanced_count INTEGER NOT NULL DEFAULT 0,
+    pass_loose_count    INTEGER NOT NULL DEFAULT 0,
+    passed_count        INTEGER NOT NULL DEFAULT 0,
+    status              TEXT    NOT NULL DEFAULT 'running',
+    error               TEXT    NOT NULL DEFAULT ''
+);
+"""
+
+# 只读视图 DDL（设计 §13.3）；独立保存便于旧库迁移时核对定义漂移并重建。
+SCREEN_VIEW_SQL: dict[str, str] = {
+    "v_screen_latest_done": """
+CREATE VIEW IF NOT EXISTS v_screen_latest_done AS
+SELECT d.*
+FROM market_screen_daily AS d
+WHERE d.run_date = (
+    SELECT MAX(run_date) FROM market_screen_run WHERE status = 'done'
+);
+""",
+    "v_screen_candidate_daily": """
+CREATE VIEW IF NOT EXISTS v_screen_candidate_daily AS
+SELECT
+    d.*,
+    CASE WHEN d.end_date_iso IS NOT NULL THEN
+        CAST(
+            julianday(d.end_date_iso)
+            - julianday(date('now', '+8 hours'))
+            + 0.999999
+        AS INTEGER)
+    END AS days_left_today,
+    CASE
+        WHEN d.end_date_iso IS NULL THEN NULL
+        WHEN CAST(julianday(d.end_date_iso)
+                  - julianday(date('now', '+8 hours')) + 0.999999 AS INTEGER) <= 30
+            THEN 'near_30d'
+        WHEN CAST(julianday(d.end_date_iso)
+                  - julianday(date('now', '+8 hours')) + 0.999999 AS INTEGER) <= 90
+            THEN 'mid_90d'
+        ELSE 'far_90d_plus'
+    END AS time_band,
+    CASE
+        WHEN d.prob_yes IS NULL THEN NULL
+        WHEN d.prob_yes <= 0.5 THEN 'yes_underdog'
+        ELSE 'yes_favorite'
+    END AS side_label,
+    CASE
+        WHEN d.minority_prob IS NULL THEN NULL
+        WHEN d.minority_prob <= 0.02 THEN 'extreme'
+        WHEN d.minority_prob <= 0.10 THEN 'moderate'
+        ELSE 'central'
+    END AS prob_band
+FROM market_screen_daily AS d;
+""",
+    "v_screen_persistent_10d": """
+CREATE VIEW IF NOT EXISTS v_screen_persistent_10d AS
+WITH base AS (
+    SELECT d.*
+    FROM market_screen_daily AS d
+    WHERE d.run_date >= date('now', '+8 hours', '-9 days')
+      AND d.run_date <= date('now', '+8 hours')
+),
+agg AS (
+    SELECT
+        condition_id,
+        COUNT(DISTINCT run_date)                AS hit_days,
+        COUNT(*)                                AS row_count,
+        MIN(volume_24h)                         AS min_volume_24h,
+        AVG(volume_24h)                         AS avg_volume_24h,
+        MAX(volume_24h)                         AS max_volume_24h,
+        MIN(rank_no)                            AS best_rank,
+        MAX(rank_no)                            AS worst_rank,
+        MIN(run_date)                           AS first_run_date,
+        MAX(run_date)                           AS last_run_date
+    FROM base
+    GROUP BY condition_id
+),
+latest AS (
+    SELECT b.*
+    FROM base AS b
+    JOIN (
+        SELECT condition_id, MAX(run_date) AS max_date
+        FROM base GROUP BY condition_id
+    ) t ON t.condition_id = b.condition_id AND t.max_date = b.run_date
+)
+SELECT
+    a.condition_id,
+    a.hit_days, a.row_count,
+    a.min_volume_24h, a.avg_volume_24h, a.max_volume_24h,
+    a.best_rank, a.worst_rank, a.first_run_date, a.last_run_date,
+    l.slug, l.question, l.end_date_iso,
+    l.remaining_days,
+    l.prob_yes, l.prob_no, l.minority_prob,
+    l.volume_24h  AS latest_volume_24h,
+    l.rank_no     AS latest_rank_no,
+    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed
+FROM agg AS a
+JOIN latest AS l ON l.condition_id = a.condition_id;
+""",
+}
+
+# FR9 只读查询允许访问的白名单视图/表（其余名称拒绝，禁止任意 SQL 拼接）。
+_SCREEN_READABLE = frozenset(
+    {
+        "v_screen_latest_done",
+        "v_screen_candidate_daily",
+        "v_screen_persistent_10d",
+        "market_screen_daily",
+        "market_screen_run",
+    }
+)
+
+_SCREEN_PRESET_COLUMNS = {
+    "strict": "pass_strict",
+    "balanced": "pass_balanced",
+    "loose": "pass_loose",
+}
+
+_SCREEN_DAILY_COLUMNS = (
+    "run_date, condition_id, rank_no, slug, question, outcomes, "
+    "end_date_iso, end_date_raw, remaining_days, prob_yes, prob_no, minority_prob, "
+    "volume_24h, volume_metric, horizon_preset, threshold_lo, horizon_pass, "
+    "pass_strict, pass_balanced, pass_loose, screen_passed, screen_reason, collected_ts"
+)
+
+_RUN_UPSERT_SQL = """
+INSERT INTO market_screen_run (
+    run_date, started_at, finished_at, elapsed_ms, pages_fetched, candidate_count,
+    horizon_preset, pass_strict_count, pass_balanced_count, pass_loose_count,
+    passed_count, status, error
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(run_date) DO UPDATE SET
+    started_at=excluded.started_at, finished_at=excluded.finished_at,
+    elapsed_ms=excluded.elapsed_ms, pages_fetched=excluded.pages_fetched,
+    candidate_count=excluded.candidate_count, horizon_preset=excluded.horizon_preset,
+    pass_strict_count=excluded.pass_strict_count,
+    pass_balanced_count=excluded.pass_balanced_count,
+    pass_loose_count=excluded.pass_loose_count,
+    passed_count=excluded.passed_count, status=excluded.status, error=excluded.error
+"""
+
+# 模板⑦-b：hit_days 聚合（允许偶缺一天）。占位顺序：
+# start_date, end_date, max_rank, min_hit_days, min_volume_24h,
+# min_remaining_days, prob_max。
+_SQL_PERSISTENT_HIT = """
+WITH base AS (
+    SELECT * FROM market_screen_daily
+    WHERE run_date BETWEEN ? AND ?
+      AND rank_no <= ?
+),
+agg AS (
+    SELECT condition_id,
+        COUNT(DISTINCT run_date) AS hit_days,
+        COUNT(*) AS row_count,
+        MIN(volume_24h) AS min_volume_24h,
+        AVG(volume_24h) AS avg_volume_24h,
+        MAX(volume_24h) AS max_volume_24h,
+        MIN(rank_no) AS best_rank,
+        MAX(rank_no) AS worst_rank,
+        MIN(run_date) AS first_run_date,
+        MAX(run_date) AS last_run_date
+    FROM base GROUP BY condition_id
+    HAVING COUNT(DISTINCT run_date) >= ?
+       AND MIN(volume_24h) >= ?
+)
+SELECT a.condition_id, a.hit_days, a.row_count,
+    a.min_volume_24h, a.avg_volume_24h, a.max_volume_24h,
+    a.best_rank, a.worst_rank, a.first_run_date, a.last_run_date,
+    l.slug, l.question, l.end_date_iso, l.remaining_days,
+    l.prob_yes, l.prob_no, l.minority_prob,
+    l.volume_24h AS latest_volume_24h, l.rank_no AS latest_rank_no,
+    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed
+FROM agg AS a
+JOIN market_screen_daily AS l
+  ON l.condition_id = a.condition_id AND l.run_date = a.last_run_date
+WHERE l.remaining_days >= ?
+  AND l.{prob_col} <= ?
+ORDER BY a.hit_days DESC, a.min_volume_24h DESC, l.minority_prob ASC
+"""
+
+# 模板⑧：严格连续 max_streak。占位顺序：
+# start_date, end_date, min_volume_24h, max_rank, min_streak,
+# min_remaining_days, prob_max。
+_SQL_PERSISTENT_STREAK = """
+WITH eligible AS (
+    SELECT condition_id, run_date, question, end_date_iso,
+           remaining_days, prob_yes, minority_prob, volume_24h, rank_no
+    FROM market_screen_daily
+    WHERE run_date BETWEEN ? AND ?
+      AND volume_24h >= ?
+      AND rank_no <= ?
+),
+numbered AS (
+    SELECT condition_id, run_date,
+        ROW_NUMBER() OVER (
+            PARTITION BY condition_id ORDER BY run_date
+        ) AS rn
+    FROM eligible
+),
+islands AS (
+    SELECT condition_id,
+           CAST(julianday(run_date) - rn AS INTEGER) AS grp,
+           COUNT(*) AS streak
+    FROM numbered GROUP BY condition_id, grp
+),
+streak AS (
+    SELECT condition_id, MAX(streak) AS max_streak
+    FROM islands GROUP BY condition_id
+),
+latest_in_window AS (
+    SELECT e.* FROM eligible e
+    JOIN (
+        SELECT condition_id, MAX(run_date) AS last_date FROM eligible
+        GROUP BY condition_id
+    ) t ON t.condition_id = e.condition_id AND t.last_date = e.run_date
+)
+SELECT s.condition_id, s.max_streak,
+    l.question, l.end_date_iso, l.remaining_days,
+    l.prob_yes, l.minority_prob,
+    l.volume_24h AS latest_volume_24h, l.rank_no AS latest_rank_no
+FROM streak AS s
+JOIN latest_in_window AS l ON l.condition_id = s.condition_id
+WHERE s.max_streak >= ?
+  AND l.remaining_days >= ?
+  AND l.{prob_col} <= ?
+ORDER BY s.max_streak DESC, l.volume_24h DESC
 """
 
 
@@ -142,6 +416,23 @@ class Storage:
             await self._execute("DROP TABLE snap_volume_baseline")
             await self._execute_script(SCHEMA)
             logger.info("snap_volume_baseline 已迁移为按桶结构（v10）")
+
+        # 只读视图：新库幂等创建；旧库定义漂移则 DROP 后重建（G7）。
+        for view_name, view_sql in SCREEN_VIEW_SQL.items():
+            await self._ensure_view(view_name, view_sql)
+
+    async def _ensure_view(self, name: str, sql: str) -> None:
+        """核对视图定义；不存在则建，定义漂移则重建。"""
+        row = await self._fetchone(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name=?", (name,)
+        )
+        if row is None:
+            await self._execute_script(sql)
+            return
+        existing = (row["sql"] or "").strip()
+        if existing != sql.strip():
+            await self._execute(f"DROP VIEW IF EXISTS {name}")
+            await self._execute_script(sql)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -190,6 +481,24 @@ class Storage:
             return await asyncio.to_thread(
                 lambda: self.conn.execute(sql, params).fetchone(),
             )
+
+    async def _transaction(self, work: Callable[[], None]) -> None:
+        """锁内单事务：work() 内多条写语句累积提交；异常回滚后重抛。
+
+        连接未显式设置 isolation_level（sqlite3 默认 deferred 隐式事务），
+        这里不先 execute("BEGIN")，避免与隐式事务冲突；事务内不跨 await 做 IO。
+        """
+        async with self._lock:
+
+            def _inner() -> None:
+                try:
+                    work()
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+
+            await asyncio.to_thread(_inner)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -637,3 +946,122 @@ class Storage:
             "success": int(row["success"] or 0),
             "failed": int(row["failed"] or 0),
         }
+
+    # ---- 每日市场筛选（Market Screen）----
+
+    @staticmethod
+    def _daily_params(row: CandidateMarket) -> tuple[Any, ...]:
+        return (
+            row.run_date, row.condition_id, row.rank_no, row.slug, row.question,
+            row.outcomes_json, row.end_date_iso, row.end_date_raw, row.remaining_days,
+            row.prob_yes, row.prob_no, row.minority_prob, row.volume_24h,
+            row.volume_metric, row.horizon_preset, row.threshold_lo, row.horizon_pass,
+            row.pass_strict, row.pass_balanced, row.pass_loose, row.screen_passed,
+            row.screen_reason, row.collected_ts,
+        )
+
+    @staticmethod
+    def _run_params(meta: ScreenRunMeta) -> tuple[Any, ...]:
+        return (
+            meta.run_date, meta.started_at, meta.finished_at, meta.elapsed_ms,
+            meta.pages_fetched, meta.candidate_count, meta.horizon_preset,
+            meta.pass_strict_count, meta.pass_balanced_count, meta.pass_loose_count,
+            meta.passed_count, meta.status, meta.error,
+        )
+
+    async def replace_screen_day(
+        self,
+        run_date: str,
+        rows: list[CandidateMarket],
+        meta: ScreenRunMeta,
+    ) -> None:
+        """单事务替换当日分区：删旧明细 → 批量插本轮候选 → UPSERT run 元信息。
+
+        任一阶段失败回滚，不留半写入明细；事务内不跨 await 做 IO。
+        """
+
+        def _work() -> None:
+            conn = self.conn
+            conn.execute(
+                "DELETE FROM market_screen_daily WHERE run_date=?", (run_date,)
+            )
+            if rows:
+                placeholders = ",".join("?" for _ in range(23))
+                conn.executemany(
+                    f"INSERT INTO market_screen_daily ({_SCREEN_DAILY_COLUMNS}) "
+                    f"VALUES ({placeholders})",
+                    [self._daily_params(row) for row in rows],
+                )
+            conn.execute(_RUN_UPSERT_SQL, self._run_params(meta))
+
+        await self._transaction(_work)
+
+    async def list_screen_daily(
+        self,
+        run_date: str,
+        *,
+        passed_only: bool = False,
+        preset: str | None = None,
+    ) -> list[dict[str, object]]:
+        sql = "SELECT * FROM market_screen_daily WHERE run_date=?"
+        params: list[Any] = [run_date]
+        if passed_only:
+            sql += " AND screen_passed=1"
+        if preset is not None:
+            column = _SCREEN_PRESET_COLUMNS.get(preset)
+            if column is not None:
+                sql += f" AND {column}=1"
+        rows = await self._fetchall(sql, tuple(params))
+        return [dict(row) for row in rows]
+
+    async def query_screen_rows(
+        self, view_name: str, params: dict[str, object]
+    ) -> list[dict[str, object]]:
+        """FR9 通用只读查询封装；视图/表白名单，值一律 ? 绑定。"""
+        if view_name not in _SCREEN_READABLE:
+            raise ValueError(f"非法只读视图/表: {view_name!r}")
+        rows = await self._fetchall(
+            f"SELECT * FROM {view_name}", tuple(params.values())
+        )
+        return [dict(row) for row in rows]
+
+    async def query_persistent_rows(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        max_rank: int,
+        min_hit_days: int,
+        min_volume_24h: float,
+        min_remaining_days: int,
+        prob_max: float,
+        prob_side: str = "minority",
+        require_consecutive: bool = False,
+    ) -> list[dict[str, object]]:
+        """持续性主场景只读聚合；⑦-b hit_days 或 ⑧ max_streak，参数全部绑定。"""
+        prob_col = "prob_yes" if prob_side == "yes" else "minority_prob"
+        if require_consecutive:
+            sql = _SQL_PERSISTENT_STREAK.format(prob_col=prob_col)
+            params: tuple[Any, ...] = (
+                start_date, end_date, min_volume_24h, max_rank, min_hit_days,
+                min_remaining_days, prob_max,
+            )
+        else:
+            sql = _SQL_PERSISTENT_HIT.format(prob_col=prob_col)
+            params = (
+                start_date, end_date, max_rank, min_hit_days, min_volume_24h,
+                min_remaining_days, prob_max,
+            )
+        rows = await self._fetchall(sql, params)
+        return [dict(row) for row in rows]
+
+    async def prune_screen(self, retention_days: int) -> None:
+        """删除早于「今天 − retention_days」的明细行与对应 run 行；临界当日保留。"""
+        days = retention_days if retention_days > 0 else 30
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+        await self._execute(
+            "DELETE FROM market_screen_daily WHERE run_date < ?", (cutoff,)
+        )
+        await self._execute(
+            "DELETE FROM market_screen_run WHERE run_date < ?", (cutoff,)
+        )

@@ -20,7 +20,7 @@ from framework.models.event import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
 from src.notify import Notifier, build_notifiers
-from src.settings import MarketEntry, Settings, resolve_daily_config
+from src.settings import MarketEntry, Settings, resolve_daily_config, resolve_market_screen_config
 from src.snapshots.collector import SnapshotCollector
 from src.snapshots.commands import DailyCommandHandler, SnapshotCommandHandler
 from src.sources.data_api_client import DataApiClient
@@ -35,12 +35,16 @@ from framework.runtime.loops import (
     funnel_watch_loop,
     heartbeat_writer,
     health_watcher,
+    market_screen_loop,
     prune_loop,
     snapshot_collect_loop,
     snapshot_push_loop,
     supervised,
     _snapshot_collect_round,
 )
+from framework.sources.market_lister import GammaMarketLister
+from framework.store.market_screen_store import MarketScreenStore
+from features.market_screen.usecase import MarketScreenUsecase
 
 logger = logging.getLogger("app")
 
@@ -54,6 +58,7 @@ class AppHandle:
         self.storage: Storage | None = None
         self.snap_collector: SnapshotCollector | None = None
         self.pipeline: PipelineRunner | None = None
+        self.ms_lister: GammaMarketLister | None = None
 
 
 async def build_app(config_path: str) -> AppHandle:
@@ -331,6 +336,34 @@ async def build_app(config_path: str) -> AppHandle:
                 lambda: daily_report_loop(storage, daily_cfg, _fire_daily_report, stop_event),
                 stop_event)))
 
+    # ── 每日市场筛选（直连注册，不经 feature bootstrap）──
+    ms_cfg = resolve_market_screen_config(settings)
+    for _warn in ms_cfg.warnings:
+        logger.warning("market_screen 配置警告: %s", _warn)
+    for _err in ms_cfg.errors:
+        logger.error("market_screen 配置致命错误: %s", _err)
+    if ms_cfg.enabled:
+        ms_lister = GammaMarketLister(
+            base_url=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
+            timeout_seconds=ms_cfg.request_timeout_seconds,
+            max_retries=ms_cfg.retry_attempts,
+            retry_backoff_seconds=ms_cfg.retry_backoff_seconds,
+            page_interval_seconds=ms_cfg.page_delay_seconds,
+        )
+        ms_store = MarketScreenStore(storage, config=ms_cfg)
+        ms_usecase = MarketScreenUsecase(ms_lister, ms_store, config=ms_cfg)
+        h.ms_lister = ms_lister
+        tasks.append(asyncio.create_task(supervised(
+            "market_screen",
+            lambda: market_screen_loop(storage, ms_cfg, ms_usecase.run, stop_event),
+            stop_event)))
+        logger.info(
+            "market_screen 任务已注册（schedule=%s, preset=%s, top_n=%d）",
+            ms_cfg.schedule, ms_cfg.main_preset, ms_cfg.top_n,
+        )
+    else:
+        logger.info("market_screen 未启用或配置存在致命错误，任务不注册")
+
     # ── feature bootstrap（必须成功，失败直接 crash）──
     from framework.bootstrap import build_runtime
     from features.market_snapshot.renderer import SnapshotSummaryRenderer
@@ -404,6 +437,8 @@ async def shutdown_app(h: AppHandle) -> None:
     await asyncio.gather(*h.tasks, return_exceptions=True)
     if h.snap_collector:
         await h.snap_collector.aclose()
+    if h.ms_lister:
+        await h.ms_lister.aclose()
     if h.storage:
         await h.storage.close()
     logger.info("服务已停止")

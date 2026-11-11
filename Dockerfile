@@ -10,5 +10,8 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY src ./src
+COPY framework ./framework
+COPY features ./features
+COPY config ./config
 
 CMD ["python", "-m", "src.main", "--config", "config/config.yaml"]

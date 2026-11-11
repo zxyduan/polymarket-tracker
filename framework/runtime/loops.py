@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from src.settings import DailyReportConfig, Settings
+from src.settings import DailyReportConfig, MarketScreenConfig, Settings
 from src.snapshots.collector import SnapshotCollector
 from src.storage import Storage
 from src.utils.retry import backoff_delay
@@ -74,10 +74,11 @@ async def funnel_watch_loop(
 
 
 async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.Event) -> None:
-    """每日清理：过期事件、过期推送记录、过期快照，并 VACUUM 回收文件空间。"""
+    """每日清理：过期事件、过期推送记录、过期快照、过期筛选候选，并 VACUUM。"""
     events_days = int(settings.get("events.retention_days", 180))
     notifications_days = int(settings.get("events.notifications_retention_days", 30))
     snapshot_days = int(settings.snapshot.get("retention_days", 90))
+    screen_days = int(settings.market_screen.get("retention_days", 30))
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=86400)
@@ -85,10 +86,11 @@ async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.E
             await storage.prune_events(events_days)
             await storage.prune_notifications(notifications_days)
             await storage.prune_snapshots(snapshot_days)
+            await storage.prune_screen(screen_days)
             await storage.vacuum()
             logger.info(
-                "数据清理完成（事件 %d 天 / 推送记录 %d 天 / 快照 %d 天 / 已 VACUUM）",
-                events_days, notifications_days, snapshot_days,
+                "数据清理完成（事件 %d 天 / 推送记录 %d 天 / 快照 %d 天 / 筛选 %d 天 / 已 VACUUM）",
+                events_days, notifications_days, snapshot_days, screen_days,
             )
 
 
@@ -258,6 +260,45 @@ async def daily_report_loop(
             wait_seconds = (
                 60 if await storage.get_state(state_key) is not None
                 else _DAILY_RETRY_WAIT_SECONDS
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+
+
+# ── 市场筛选调度 ──────────────────────────────────────────────────────────
+
+
+async def market_screen_loop(
+    storage: Storage,
+    cfg: MarketScreenConfig,
+    trigger_screen: Callable[[], Awaitable[str]],
+    stop_event: asyncio.Event,
+) -> None:
+    """每日单时刻跑市场筛选；done/empty 落 state 防重，failed 按 retry 秒重试。"""
+    local_tz = timezone(timedelta(hours=cfg.timezone_offset_hours))
+    while not stop_event.is_set():
+        now_local = datetime.now(local_tz)
+        date_key = now_local.strftime("%Y-%m-%d")
+        state_key = f"market_screen:{date_key}"
+        if (now_local.hour, now_local.minute) == (cfg.schedule_hour, cfg.schedule_minute):
+            if await storage.get_state(state_key) is None:
+                try:
+                    result = await trigger_screen()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("市场筛选触发异常: %s", exc)
+                    result = "failed"
+                if result != "failed":
+                    await storage.set_state(state_key, result)
+                    logger.info("当日市场筛选完成: %s = %s", date_key, result)
+            wait_seconds = (
+                60 if await storage.get_state(state_key) is not None else cfg.retry_seconds
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)

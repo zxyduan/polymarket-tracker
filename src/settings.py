@@ -212,6 +212,11 @@ class Settings:
         """digest 配置节（交易员告警批量摘要）。"""
         return self.section("digest")
 
+    @property
+    def market_screen(self) -> dict[str, Any]:
+        """market_screen 配置节（每日市场筛选）。"""
+        return self.section("market_screen")
+
     def section(self, name: str) -> dict[str, Any]:
         """取一个配置节，缺失时返回空 dict。"""
         return dict(self.raw.get(name, {}) or {})
@@ -358,6 +363,290 @@ def resolve_daily_config(settings: Settings) -> DailyReportConfig:
         page_size=page_size,
         segment_delay_seconds=segment_delay_seconds,
         dedup=dedup,
+        errors=errors,
+        warnings=warnings,
+    )
+
+
+@dataclass(frozen=True)
+class QueryDefaults:
+    """持续性只读查询的默认参数（门面未显式传入时回落）。"""
+
+    window_days: int = 10
+    min_hit_days: int = 10
+    min_volume_24h: float = 50000.0
+    max_rank: int = 200
+    min_remaining_days: int = 31
+    prob_max: float = 0.15
+    prob_side: str = "minority"
+    require_consecutive: bool = False
+
+
+@dataclass(frozen=True)
+class MarketScreenConfig:
+    """market_screen 节解析结果（含校验输出，fail-soft）。
+
+    内部拍平为扁平字段供用例/门面访问；原始 YAML 按设计 §9 嵌套
+    `volume` / `horizon_prob` / `query_defaults` / `notify` 子节。
+    """
+
+    enabled: bool
+    schedule: str
+    schedule_hour: int
+    schedule_minute: int
+    timezone_offset_hours: int
+    retry_seconds: int
+    retention_days: int
+    # volume 子节
+    volume_metric: str
+    min_value: float
+    top_n: int
+    page_limit: int
+    max_pages: int
+    request_timeout_seconds: int
+    retry_attempts: int
+    retry_backoff_seconds: float
+    page_delay_seconds: float
+    # horizon_prob 子节
+    horizon_enabled: bool
+    main_preset: str
+    record_all_presets: bool
+    mode: str
+    clamp_min: float
+    clamp_max: float
+    custom_anchors: list[dict[str, float]] | None
+    # 顶层开关
+    binary_only: bool
+    persist_non_passed: bool
+    notify_enabled: bool
+    query_defaults: QueryDefaults
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+_VALID_PRESETS = ("strict", "balanced", "loose")
+
+
+def _coerce_int(raw: Any, default: int, warnings: list[str], label: str) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        warnings.append(f"market_screen.{label} 非法: {raw!r}，回退 {default}")
+        return default
+
+
+def _coerce_float(raw: Any, default: float, warnings: list[str], label: str) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        warnings.append(f"market_screen.{label} 非法: {raw!r}，回退 {default}")
+        return default
+
+
+def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
+    """读取并校验 market_screen 节；致命错误不抛异常，返回 enabled=False + errors。"""
+    raw = settings.market_screen
+    vol = raw.get("volume") if isinstance(raw.get("volume"), dict) else {}
+    hor = raw.get("horizon_prob") if isinstance(raw.get("horizon_prob"), dict) else {}
+    qd_raw = raw.get("query_defaults") if isinstance(raw.get("query_defaults"), dict) else {}
+    notify = raw.get("notify") if isinstance(raw.get("notify"), dict) else {}
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    enabled = bool(raw.get("enabled", True))
+
+    # 调度时刻 HH:MM（08:00 默认）
+    schedule = str(raw.get("schedule", "08:00")).strip()
+    schedule_hour, schedule_minute = 8, 0
+    try:
+        h_str, m_str = schedule.split(":")
+        schedule_hour, schedule_minute = int(h_str), int(m_str)
+        if not (0 <= schedule_hour <= 23 and 0 <= schedule_minute <= 59):
+            raise ValueError("out of range")
+    except (ValueError, IndexError):
+        errors.append(f"market_screen.schedule 非法: {schedule!r}（HH:MM）")
+        schedule_hour, schedule_minute = 8, 0
+
+    tz = raw.get("timezone_offset_hours", settings.get("display.timezone_offset_hours", 8))
+    try:
+        timezone_offset_hours = int(tz)
+    except (TypeError, ValueError):
+        warnings.append(f"market_screen.timezone_offset_hours 非法: {tz!r}，回退 8")
+        timezone_offset_hours = 8
+    if timezone_offset_hours != 8:
+        warnings.append(
+            "视图 B/C 动态剩余天数写死按 UTC+8；时区偏移分叉需 P2 可配化"
+        )
+
+    retry_seconds = _coerce_int(raw.get("retry_seconds", 5), 5, warnings, "retry_seconds")
+
+    try:
+        retention_days = int(raw.get("retention_days", 30))
+    except (TypeError, ValueError):
+        retention_days = 30
+    if retention_days < 1:
+        warnings.append("market_screen.retention_days 非法，回退 30")
+        retention_days = 30
+
+    # ── volume 子节 ──
+    volume_metric = str(vol.get("metric", "volume24hr")).strip()
+    if volume_metric != "volume24hr":
+        warnings.append(f"volume.metric 仅支持 volume24hr，回退；收到 {volume_metric!r}")
+        volume_metric = "volume24hr"
+
+    min_value = _coerce_float(vol.get("min_value", 50000.0), 50000.0, warnings, "volume.min_value")
+    if min_value < 0:
+        errors.append("volume.min_value 不能为负")
+        min_value = 50000.0
+
+    top_n = _coerce_int(vol.get("top_n", 200), 200, warnings, "volume.top_n")
+    if top_n < 1:
+        errors.append("volume.top_n 必须 ≥ 1")
+        top_n = 200
+    page_limit = _coerce_int(vol.get("page_limit", 100), 100, warnings, "volume.page_limit")
+    if page_limit < 1:
+        errors.append("volume.page_limit 必须 ≥ 1")
+        page_limit = 100
+    max_pages = _coerce_int(vol.get("max_pages", 4), 4, warnings, "volume.max_pages")
+    if page_limit * max_pages < top_n:
+        warnings.append("volume.page_limit × max_pages 小于 top_n，候选可能截断在翻页上限")
+
+    request_timeout_seconds = _coerce_int(
+        vol.get("request_timeout_seconds", settings.get("polling.request_timeout_seconds", 10)),
+        10, warnings, "volume.request_timeout_seconds",
+    )
+    if request_timeout_seconds <= 0:
+        request_timeout_seconds = 10
+    retry_attempts = _coerce_int(vol.get("retry_attempts", 2), 2, warnings, "volume.retry_attempts")
+    if retry_attempts < 0:
+        retry_attempts = 2
+    retry_backoff_seconds = _coerce_float(
+        vol.get("retry_backoff_seconds", 1.0), 1.0, warnings, "volume.retry_backoff_seconds"
+    )
+    if retry_backoff_seconds < 0:
+        retry_backoff_seconds = 1.0
+    page_delay_seconds = _coerce_float(
+        vol.get("page_delay_seconds", 0.2), 0.2, warnings, "volume.page_delay_seconds"
+    )
+    if page_delay_seconds < 0:
+        page_delay_seconds = 0.2
+
+    # ── horizon_prob 子节 ──
+    horizon_enabled = bool(hor.get("enabled", True))
+
+    main_preset = str(hor.get("preset", "balanced")).strip()
+    if main_preset not in _VALID_PRESETS:
+        errors.append(f"horizon_prob.preset 非法: {main_preset!r}，须为 {_VALID_PRESETS}")
+        main_preset = "balanced"
+
+    record_all_raw = hor.get("record_all_presets", True)
+    if isinstance(record_all_raw, bool):
+        record_all_presets = record_all_raw
+    else:
+        warnings.append("horizon_prob.record_all_presets 非布尔，按 true 处理")
+        record_all_presets = True
+
+    mode = str(hor.get("mode", "anchor_linear")).strip()
+    if mode != "anchor_linear":
+        warnings.append("horizon_prob.mode 仅支持 anchor_linear（formula 预留 P2），已忽略")
+        mode = "anchor_linear"
+
+    clamp_min = _coerce_float(hor.get("clamp_min", 0.002), 0.002, warnings, "horizon_prob.clamp_min")
+    clamp_max = _coerce_float(hor.get("clamp_max", 0.20), 0.20, warnings, "horizon_prob.clamp_max")
+    if clamp_min >= clamp_max:
+        warnings.append("horizon_prob.clamp_min 必须小于 clamp_max，已回退默认")
+        clamp_min, clamp_max = 0.002, 0.20
+
+    # 自定义锚点：单组列表整体覆盖主档模板；非法升序/范围记 errors 禁用任务。
+    custom_anchors: list[dict[str, float]] | None = None
+    raw_anchors = hor.get("anchors")
+    if isinstance(raw_anchors, list) and raw_anchors:
+        cleaned: list[dict[str, float]] = []
+        prev_days = -1
+        ok = True
+        for item in raw_anchors:
+            try:
+                days = int(item["days"])
+                minority_max = float(item["minority_max"])
+            except (KeyError, TypeError, ValueError):
+                ok = False
+                break
+            if days <= prev_days or not (0.0 < minority_max < 0.5):
+                ok = False
+                break
+            prev_days = days
+            cleaned.append({"days": days, "minority_max": minority_max})
+        if ok:
+            custom_anchors = cleaned
+        else:
+            errors.append(
+                "horizon_prob.anchors 非法：须 days 严格升序且 minority_max∈(0,0.5)"
+            )
+
+    binary_only = bool(raw.get("binary_only", True))
+    persist_non_passed = bool(raw.get("persist_non_passed", True))
+    if not persist_non_passed:
+        warnings.append(
+            "persist_non_passed=false 会丢失未过主档候选历史，与持续性主场景冲突，建议保持 true"
+        )
+    notify_enabled = bool(notify.get("enabled", False))
+    if notify_enabled:
+        warnings.append("notify.enabled=true：P1 不装配推送通道，该开关暂不生效")
+
+    # ── query_defaults 子节 ──
+    try:
+        prob_max = float(qd_raw.get("prob_max", 0.15))
+    except (TypeError, ValueError):
+        prob_max = 0.15
+    if not (0.0 < prob_max < 0.5):
+        warnings.append("query_defaults.prob_max 越界 (0,0.5)，回退 0.15")
+        prob_max = 0.15
+    prob_side = str(qd_raw.get("prob_side", "minority")).strip()
+    if prob_side not in ("minority", "yes"):
+        warnings.append("query_defaults.prob_side 非法，回退 minority")
+        prob_side = "minority"
+    require_consecutive = bool(qd_raw.get("require_consecutive", False))
+
+    query_defaults = QueryDefaults(
+        window_days=_coerce_int(qd_raw.get("window_days", 10), 10, warnings, "query_defaults.window_days"),
+        min_hit_days=_coerce_int(qd_raw.get("min_hit_days", 10), 10, warnings, "query_defaults.min_hit_days"),
+        min_volume_24h=_coerce_float(qd_raw.get("min_volume_24h", 50000.0), 50000.0, warnings, "query_defaults.min_volume_24h"),
+        max_rank=_coerce_int(qd_raw.get("max_rank", 200), 200, warnings, "query_defaults.max_rank"),
+        min_remaining_days=_coerce_int(qd_raw.get("min_remaining_days", 31), 31, warnings, "query_defaults.min_remaining_days"),
+        prob_max=prob_max,
+        prob_side=prob_side,
+        require_consecutive=require_consecutive,
+    )
+
+    return MarketScreenConfig(
+        enabled=enabled and not errors,
+        schedule=schedule,
+        schedule_hour=schedule_hour,
+        schedule_minute=schedule_minute,
+        timezone_offset_hours=timezone_offset_hours,
+        retry_seconds=retry_seconds,
+        retention_days=retention_days,
+        volume_metric=volume_metric,
+        min_value=min_value,
+        top_n=top_n,
+        page_limit=page_limit,
+        max_pages=max_pages,
+        request_timeout_seconds=request_timeout_seconds,
+        retry_attempts=retry_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
+        page_delay_seconds=page_delay_seconds,
+        horizon_enabled=horizon_enabled,
+        main_preset=main_preset,
+        record_all_presets=record_all_presets,
+        mode=mode,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+        custom_anchors=custom_anchors,
+        binary_only=binary_only,
+        persist_non_passed=persist_non_passed,
+        notify_enabled=notify_enabled,
+        query_defaults=query_defaults,
         errors=errors,
         warnings=warnings,
     )
