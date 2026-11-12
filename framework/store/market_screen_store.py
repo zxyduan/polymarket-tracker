@@ -72,6 +72,9 @@ class MarketScreenStore:
         prob_side: str | None = None,
         require_consecutive: bool | None = None,
         end_date: str | None = None,
+        min_reward_daily_rate: float | None = None,
+        reward_tier: str | None = None,
+        sort_mode: str | None = None,
     ) -> ScreenQueryResult:
         warnings: list[str] = []
 
@@ -100,6 +103,28 @@ class MarketScreenStore:
         if consecutive is None:
             consecutive = bool(self._default("require_consecutive", False))
 
+        reward_floor = self._coerce_float(
+            min_reward_daily_rate,
+            self._default("min_reward_daily_rate", 0.0),
+            0.0, warnings, "min_reward_daily_rate",
+        )
+        tier = str(reward_tier or "").strip().lower()
+        tier_attrs = {
+            "low": ("reward_tier_low_min", 30.0),
+            "mid": ("reward_tier_mid_min", 100.0),
+            "high": ("reward_tier_high_min", 300.0),
+        }
+        if min_reward_daily_rate is None and tier in tier_attrs:
+            attr, fallback = tier_attrs[tier]
+            reward_floor = float(getattr(self._cfg, attr, fallback))
+        elif tier and tier not in tier_attrs:
+            warnings.append(f"reward_tier 非法 {tier!r}，回退不限奖励")
+
+        mode = str(sort_mode or "persistence").strip().lower()
+        if mode not in ("persistence", "reward"):
+            warnings.append(f"sort_mode 非法 {mode!r}，回退 persistence")
+            mode = "persistence"
+
         retention = int(getattr(self._cfg, "retention_days", 30) or 30)
         if wd > retention:
             warnings.append(
@@ -117,6 +142,8 @@ class MarketScreenStore:
             prob_max=pmax,
             prob_side=side,
             require_consecutive=consecutive,
+            min_reward_daily_rate=reward_floor,
+            sort_mode=mode,
         )
         mapped = [self._map_row(row) for row in rows]
         return ScreenQueryResult(rows=mapped, warnings=warnings)
@@ -202,4 +229,6 @@ class MarketScreenStore:
             pass_loose=row.get("pass_loose"),
             screen_passed=_int("screen_passed"),
             max_streak=row.get("max_streak"),
+            latest_rewards_daily_rate=row.get("latest_rewards_daily_rate"),
+            latest_rewards_asset=str(row.get("latest_rewards_asset") or ""),
         )

@@ -36,6 +36,8 @@ class CandidateMarket:
     screen_passed: int
     screen_reason: str
     collected_ts: float
+    rewards_daily_rate: float | None = None
+    rewards_asset: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,8 @@ class PersistentCandidateRow:
     pass_loose: int | None
     screen_passed: int
     max_streak: int | None = None
+    latest_rewards_daily_rate: float | None = None
+    latest_rewards_asset: str = ""
 
 
 @dataclass(frozen=True)

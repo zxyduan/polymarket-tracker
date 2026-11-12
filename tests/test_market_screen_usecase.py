@@ -22,13 +22,27 @@ def _cfg(**overrides) -> types.SimpleNamespace:
     return base
 
 
-def _raw(cid: str, vol: float, prob_yes: str, end: str = "2027-12-31") -> dict:
-    return {
+_USDC_E = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+
+
+def _raw(
+    cid: str,
+    vol: float,
+    prob_yes: str,
+    end: str = "2027-12-31",
+    reward_rate: float = 100.0,
+) -> dict:
+    raw: dict = {
         "conditionId": cid, "slug": f"slug-{cid}", "question": f"Q {cid}",
         "outcomes": '["Yes","No"]',
         "outcomePrices": f'["{prob_yes}", "{1 - float(prob_yes):.4f}"]',
         "endDateIso": end, "volume24hr": str(vol),
     }
+    if reward_rate is not None:
+        raw["clobRewards"] = [
+            {"assetAddress": _USDC_E, "rewardsDailyRate": reward_rate, "rewardsAmount": 0}
+        ]
+    return raw
 
 
 class FakeLister:
@@ -147,3 +161,57 @@ async def test_topn_truncation():
     assert result == "done"
     assert len(store.rows) == 2
     assert [r.rank_no for r in store.rows] == [1, 2]
+
+
+# ── 奖励准入与复合排序 ──────────────────────────────────────────────────────
+
+
+async def test_reward_below_gate_not_persisted():
+    raws = [
+        _raw("0xa", 60000.0, "0.02", reward_rate=None),   # 无 clobRewards
+        _raw("0xb", 60000.0, "0.02", reward_rate=0.0),
+        _raw("0xc", 60000.0, "0.02", reward_rate=-1.0),
+        _raw("0xd", 60000.0, "0.02", reward_rate=29.9),
+    ]
+    usecase, store = _usecase(raws)
+    assert await usecase.run() == "empty"
+    assert store.rows == []
+
+
+async def test_composite_sort_reward_then_volume():
+    raws = [
+        _raw("0xa", 60000.0, "0.02", reward_rate=50.0),
+        _raw("0xb", 90000.0, "0.02", reward_rate=100.0),
+        _raw("0xc", 80000.0, "0.02", reward_rate=50.0),
+    ]
+    usecase, store = _usecase(raws)
+    await usecase.run()
+    # 奖励 100 在前；同 50 按成交额 80k 在前、60k 在后。
+    assert [r.condition_id for r in store.rows] == ["0xb", "0xc", "0xa"]
+
+
+async def test_topn_after_composite_sort():
+    raws = [
+        _raw("0xa", 60000.0, "0.02", reward_rate=40.0),
+        _raw("0xb", 70000.0, "0.02", reward_rate=200.0),
+        _raw("0xc", 80000.0, "0.02", reward_rate=120.0),
+    ]
+    usecase, store = _usecase(raws, top_n=2)
+    await usecase.run()
+    assert [r.condition_id for r in store.rows] == ["0xb", "0xc"]
+
+
+async def test_reward_fields_persisted():
+    raws = [_raw("0xa", 60000.0, "0.02", reward_rate=100.0)]
+    usecase, store = _usecase(raws)
+    await usecase.run()
+    row = store.rows[0]
+    assert row.rewards_daily_rate == pytest.approx(100.0)
+    assert row.rewards_asset == "USDC.e"
+
+
+async def test_reward_gate_follows_config():
+    raws = [_raw("0xa", 60000.0, "0.02", reward_rate=40.0)]
+    usecase, store = _usecase(raws, reward_min_daily_rate=50.0)
+    assert await usecase.run() == "empty"
+    assert store.rows == []

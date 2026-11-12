@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS market_screen_daily (
     screen_passed   INTEGER NOT NULL DEFAULT 0,
     screen_reason   TEXT    NOT NULL DEFAULT '',
     collected_ts    REAL    NOT NULL,
+    rewards_daily_rate REAL,
+    rewards_asset      TEXT    NOT NULL DEFAULT '',
     PRIMARY KEY (run_date, condition_id)
 );
 CREATE INDEX IF NOT EXISTS idx_mscreen_date_pass
@@ -240,7 +242,9 @@ SELECT
     l.prob_yes, l.prob_no, l.minority_prob,
     l.volume_24h  AS latest_volume_24h,
     l.rank_no     AS latest_rank_no,
-    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed
+    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed,
+    l.rewards_daily_rate AS latest_rewards_daily_rate,
+    l.rewards_asset      AS latest_rewards_asset
 FROM agg AS a
 JOIN latest AS l ON l.condition_id = a.condition_id;
 """,
@@ -267,7 +271,8 @@ _SCREEN_DAILY_COLUMNS = (
     "run_date, condition_id, rank_no, slug, question, outcomes, "
     "end_date_iso, end_date_raw, remaining_days, prob_yes, prob_no, minority_prob, "
     "volume_24h, volume_metric, horizon_preset, threshold_lo, horizon_pass, "
-    "pass_strict, pass_balanced, pass_loose, screen_passed, screen_reason, collected_ts"
+    "pass_strict, pass_balanced, pass_loose, screen_passed, screen_reason, collected_ts, "
+    "rewards_daily_rate, rewards_asset"
 )
 
 _RUN_UPSERT_SQL = """
@@ -316,14 +321,31 @@ SELECT a.condition_id, a.hit_days, a.row_count,
     l.slug, l.question, l.end_date_iso, l.remaining_days,
     l.prob_yes, l.prob_no, l.minority_prob,
     l.volume_24h AS latest_volume_24h, l.rank_no AS latest_rank_no,
-    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed
+    l.pass_strict, l.pass_balanced, l.pass_loose, l.screen_passed,
+    l.rewards_daily_rate AS latest_rewards_daily_rate,
+    l.rewards_asset      AS latest_rewards_asset
 FROM agg AS a
 JOIN market_screen_daily AS l
   ON l.condition_id = a.condition_id AND l.run_date = a.last_run_date
 WHERE l.remaining_days >= ?
   AND l.{prob_col} <= ?
-ORDER BY a.hit_days DESC, a.min_volume_24h DESC, l.minority_prob ASC
+{reward_clause}
+{order_by}
 """
+
+# 排序模式白名单（注入 ORDER BY，不拼接自由文本）。{prob_col} 由查询方法填充。
+_PERSISTENT_ORDER: dict[str, dict[str, str]] = {
+    "persistence": {
+        "hit": "ORDER BY a.hit_days DESC, a.min_volume_24h DESC, l.minority_prob ASC",
+        "streak": "ORDER BY s.max_streak DESC, l.volume_24h DESC",
+    },
+    "reward": {
+        "hit": "ORDER BY l.rewards_daily_rate DESC, l.remaining_days DESC, "
+               "l.{prob_col} ASC, a.hit_days DESC",
+        "streak": "ORDER BY l.rewards_daily_rate DESC, l.remaining_days DESC, "
+                  "l.{prob_col} ASC, s.max_streak DESC",
+    },
+}
 
 # 模板⑧：严格连续 max_streak。占位顺序：
 # start_date, end_date, min_volume_24h, max_rank, min_streak,
@@ -331,7 +353,8 @@ ORDER BY a.hit_days DESC, a.min_volume_24h DESC, l.minority_prob ASC
 _SQL_PERSISTENT_STREAK = """
 WITH eligible AS (
     SELECT condition_id, run_date, question, end_date_iso,
-           remaining_days, prob_yes, minority_prob, volume_24h, rank_no
+           remaining_days, prob_yes, minority_prob, volume_24h, rank_no,
+           rewards_daily_rate, rewards_asset
     FROM market_screen_daily
     WHERE run_date BETWEEN ? AND ?
       AND volume_24h >= ?
@@ -364,13 +387,16 @@ latest_in_window AS (
 SELECT s.condition_id, s.max_streak,
     l.question, l.end_date_iso, l.remaining_days,
     l.prob_yes, l.minority_prob,
-    l.volume_24h AS latest_volume_24h, l.rank_no AS latest_rank_no
+    l.volume_24h AS latest_volume_24h, l.rank_no AS latest_rank_no,
+    l.rewards_daily_rate AS latest_rewards_daily_rate,
+    l.rewards_asset      AS latest_rewards_asset
 FROM streak AS s
 JOIN latest_in_window AS l ON l.condition_id = s.condition_id
 WHERE s.max_streak >= ?
   AND l.remaining_days >= ?
   AND l.{prob_col} <= ?
-ORDER BY s.max_streak DESC, l.volume_24h DESC
+{reward_clause}
+{order_by}
 """
 
 
@@ -400,6 +426,15 @@ class Storage:
             )
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # 旧库迁移：market_screen_daily 补奖励列（新库 SCHEMA 已含），历史行不回填。
+        for _screen_alter in (
+            "ALTER TABLE market_screen_daily ADD COLUMN rewards_daily_rate REAL",
+            "ALTER TABLE market_screen_daily ADD COLUMN rewards_asset TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                await self._execute(_screen_alter)
+            except sqlite3.OperationalError:
+                pass  # 列已存在
         # 语义迁移（v11）：volume_shares 默认 -1 = 未结算/未知；历史 0.0
         # 全部是"未补算"的假 0（v10b 只写 delta>0 的补算），统一改 -1 显示"-"，
         # 不再把"未知"误导为"真零成交"。
@@ -958,6 +993,7 @@ class Storage:
             row.volume_metric, row.horizon_preset, row.threshold_lo, row.horizon_pass,
             row.pass_strict, row.pass_balanced, row.pass_loose, row.screen_passed,
             row.screen_reason, row.collected_ts,
+            row.rewards_daily_rate, row.rewards_asset,
         )
 
     @staticmethod
@@ -986,7 +1022,8 @@ class Storage:
                 "DELETE FROM market_screen_daily WHERE run_date=?", (run_date,)
             )
             if rows:
-                placeholders = ",".join("?" for _ in range(23))
+                placeholder_count = len(_SCREEN_DAILY_COLUMNS.split(","))
+                placeholders = ",".join("?" for _ in range(placeholder_count))
                 conn.executemany(
                     f"INSERT INTO market_screen_daily ({_SCREEN_DAILY_COLUMNS}) "
                     f"VALUES ({placeholders})",
@@ -1037,22 +1074,41 @@ class Storage:
         prob_max: float,
         prob_side: str = "minority",
         require_consecutive: bool = False,
+        min_reward_daily_rate: float = 0.0,
+        sort_mode: str = "persistence",
     ) -> list[dict[str, object]]:
         """持续性主场景只读聚合；⑦-b hit_days 或 ⑧ max_streak，参数全部绑定。"""
         prob_col = "prob_yes" if prob_side == "yes" else "minority_prob"
+        kind = "streak" if require_consecutive else "hit"
+
         if require_consecutive:
-            sql = _SQL_PERSISTENT_STREAK.format(prob_col=prob_col)
-            params: tuple[Any, ...] = (
+            base_params: list[Any] = [
                 start_date, end_date, min_volume_24h, max_rank, min_hit_days,
                 min_remaining_days, prob_max,
-            )
+            ]
+            template = _SQL_PERSISTENT_STREAK
         else:
-            sql = _SQL_PERSISTENT_HIT.format(prob_col=prob_col)
-            params = (
+            base_params = [
                 start_date, end_date, max_rank, min_hit_days, min_volume_24h,
                 min_remaining_days, prob_max,
-            )
-        rows = await self._fetchall(sql, params)
+            ]
+            template = _SQL_PERSISTENT_HIT
+
+        # 0 = 不额外限奖励：跳过奖励 WHERE，避免 NULL 历史行被 `>= 0` 误剔。
+        reward_clause = ""
+        params: list[Any] = list(base_params)
+        if min_reward_daily_rate > 0:
+            reward_clause = "AND l.rewards_daily_rate >= ?"
+            params.append(min_reward_daily_rate)
+
+        mode = sort_mode if sort_mode in ("persistence", "reward") else "persistence"
+        order_by = _PERSISTENT_ORDER[mode][kind].format(prob_col=prob_col)
+        sql = template.format(
+            prob_col=prob_col,
+            reward_clause=reward_clause,
+            order_by=order_by,
+        )
+        rows = await self._fetchall(sql, tuple(params))
         return [dict(row) for row in rows]
 
     async def prune_screen(self, retention_days: int) -> None:

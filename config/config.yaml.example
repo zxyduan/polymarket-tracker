@@ -123,6 +123,13 @@ market_screen:
   binary_only: true              # 仅 Yes/No 二元市场
   persist_non_passed: true       # 未过主档候选也落库（持续性主场景依赖候选池历史）
 
+  reward:
+    min_daily_rate: 30.0         # 准入：每日奖励速率下限（奖励代币/天），低于此值剔除
+    tiers:
+      low_min: 30.0              # 低档 [30, 100)
+      mid_min: 100.0             # 中档 [100, 300)
+      high_min: 300.0            # 高档 [300, +∞)
+
   query_defaults:                 # 持续性只读查询默认参数（门面未显式传入时回落）
     window_days: 10
     min_hit_days: 10
@@ -132,6 +139,7 @@ market_screen:
     min_remaining_days: 31
     prob_max: 0.15               # 小侧概率上限（主场景 ≤15%）
     prob_side: "minority"        # minority | yes
+    min_reward_daily_rate: 0.0   # 读侧奖励下限（0=不额外限）
 
   notify:
     enabled: false               # P1 不装配推送通道

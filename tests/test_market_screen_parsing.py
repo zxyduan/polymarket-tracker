@@ -9,6 +9,7 @@ import pytest
 from framework.parsing.market_screen_parsing import (
     PRESET_ANCHORS,
     PRESETS,
+    classify_reward_tier,
     evaluate_presets,
     interpolate_minority_max,
     parse_market,
@@ -16,6 +17,10 @@ from framework.parsing.market_screen_parsing import (
 )
 
 NOW = datetime(2026, 11, 11, 8, 0, 0)
+
+
+_USDC_E = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+_PUSD = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 
 
 def _good_raw(**overrides):
@@ -27,6 +32,9 @@ def _good_raw(**overrides):
         "outcomePrices": '["0.0175","0.9825"]',
         "endDateIso": "2028-11-07",
         "volume24hr": "60000.0",
+        "clobRewards": [
+            {"assetAddress": _USDC_E, "rewardsDailyRate": "100", "rewardsAmount": 0}
+        ],
     }
     raw.update(overrides)
     return raw
@@ -162,3 +170,82 @@ def test_parse_market_end_date_with_time_and_messy_end_date():
 def test_parse_market_dirty_rows_return_none(overrides):
     row = parse_market(_good_raw(**overrides), now=NOW, tz_offset_hours=8)
     assert row is None
+
+
+# ── 奖励字段解析 ────────────────────────────────────────────────────────────
+
+
+def test_reward_parses_list():
+    row = parse_market(_good_raw(), now=NOW, tz_offset_hours=8)
+    assert row is not None
+    assert row.rewards_daily_rate == pytest.approx(100.0)
+    assert row.rewards_asset == "USDC.e"
+
+
+def test_reward_stringified_json():
+    raw = _good_raw(
+        clobRewards=f'[{{"assetAddress": "{_PUSD}", "rewardsDailyRate": "60"}}]'
+    )
+    row = parse_market(raw, now=NOW, tz_offset_hours=8)
+    assert row is not None
+    assert row.rewards_daily_rate == pytest.approx(60.0)
+    assert row.rewards_asset == "pUSD"
+
+
+@pytest.mark.parametrize("rewards", [None, [], ""])
+def test_reward_missing_or_blank(rewards):
+    row = parse_market(_good_raw(clobRewards=rewards), now=NOW, tz_offset_hours=8)
+    assert row is not None
+    assert row.rewards_daily_rate is None and row.rewards_asset == ""
+
+
+@pytest.mark.parametrize("bad", ["abc", True, None, float("nan"), float("inf")])
+def test_reward_non_numeric_to_none(bad):
+    raw = _good_raw(
+        clobRewards=[{"assetAddress": _USDC_E, "rewardsDailyRate": bad}]
+    )
+    row = parse_market(raw, now=NOW, tz_offset_hours=8)
+    assert row is not None and row.rewards_daily_rate is None
+
+
+def test_reward_unknown_address_lowercased():
+    addr = "0xaaa111bbb222ccc333ddd444eee555fff6667778"
+    raw = _good_raw(
+        clobRewards=[{"assetAddress": addr.upper(), "rewardsDailyRate": "40"}]
+    )
+    row = parse_market(raw, now=NOW, tz_offset_hours=8)
+    assert row is not None and row.rewards_asset == addr
+
+
+def test_reward_multiple_takes_first():
+    raw = _good_raw(
+        clobRewards=[
+            {"assetAddress": _USDC_E, "rewardsDailyRate": "600"},
+            {"assetAddress": _PUSD, "rewardsDailyRate": "10"},
+        ]
+    )
+    row = parse_market(raw, now=NOW, tz_offset_hours=8)
+    assert row is not None
+    assert row.rewards_daily_rate == pytest.approx(600.0)
+    assert row.rewards_asset == "USDC.e"
+
+
+def test_reward_dirty_does_not_drop_row():
+    row = parse_market(
+        _good_raw(clobRewards="not-a-json"), now=NOW, tz_offset_hours=8
+    )
+    assert row is not None and row.rewards_daily_rate is None
+
+
+@pytest.mark.parametrize(
+    "rate,expected",
+    [
+        (29.9, None), (30.0, "low"), (99.99, "low"), (100.0, "mid"),
+        (299.99, "mid"), (300.0, "high"), (300.1, "high"),
+        (None, None), (float("nan"), None), (float("inf"), None),
+    ],
+)
+def test_classify_reward_tier_boundaries(rate, expected):
+    assert classify_reward_tier(
+        rate, low_min=30.0, mid_min=100.0, high_min=300.0
+    ) == expected

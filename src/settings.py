@@ -380,6 +380,7 @@ class QueryDefaults:
     prob_max: float = 0.15
     prob_side: str = "minority"
     require_consecutive: bool = False
+    min_reward_daily_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -419,6 +420,11 @@ class MarketScreenConfig:
     binary_only: bool
     persist_non_passed: bool
     notify_enabled: bool
+    # reward 子节
+    reward_min_daily_rate: float
+    reward_tier_low_min: float
+    reward_tier_mid_min: float
+    reward_tier_high_min: float
     query_defaults: QueryDefaults
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -450,6 +456,7 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
     hor = raw.get("horizon_prob") if isinstance(raw.get("horizon_prob"), dict) else {}
     qd_raw = raw.get("query_defaults") if isinstance(raw.get("query_defaults"), dict) else {}
     notify = raw.get("notify") if isinstance(raw.get("notify"), dict) else {}
+    rw = raw.get("reward") if isinstance(raw.get("reward"), dict) else {}
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -594,6 +601,24 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
     if notify_enabled:
         warnings.append("notify.enabled=true：P1 不装配推送通道，该开关暂不生效")
 
+    # ── reward 子节：准入线 + 分档阈值 ──
+    reward_min_daily_rate = _coerce_float(
+        rw.get("min_daily_rate", 30.0), 30.0, warnings, "reward.min_daily_rate"
+    )
+    if reward_min_daily_rate < 0:
+        warnings.append("reward.min_daily_rate 不能为负，回退 30.0")
+        reward_min_daily_rate = 30.0
+
+    tiers_raw = rw.get("tiers") if isinstance(rw.get("tiers"), dict) else {}
+    tier_low = _coerce_float(tiers_raw.get("low_min", 30.0), 30.0, warnings, "reward.tiers.low_min")
+    tier_mid = _coerce_float(tiers_raw.get("mid_min", 100.0), 100.0, warnings, "reward.tiers.mid_min")
+    tier_high = _coerce_float(tiers_raw.get("high_min", 300.0), 300.0, warnings, "reward.tiers.high_min")
+    if not (0.0 <= tier_low <= tier_mid <= tier_high):
+        warnings.append("reward.tiers 阈值须非降序 0<=low<=mid<=high，回退 30/100/300")
+        tier_low, tier_mid, tier_high = 30.0, 100.0, 300.0
+    if reward_min_daily_rate > tier_low:
+        warnings.append("reward.min_daily_rate 高于低档下限，低档区间部分不可达")
+
     # ── query_defaults 子节 ──
     try:
         prob_max = float(qd_raw.get("prob_max", 0.15))
@@ -607,6 +632,13 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
         warnings.append("query_defaults.prob_side 非法，回退 minority")
         prob_side = "minority"
     require_consecutive = bool(qd_raw.get("require_consecutive", False))
+    min_reward_daily_rate = _coerce_float(
+        qd_raw.get("min_reward_daily_rate", 0.0), 0.0, warnings,
+        "query_defaults.min_reward_daily_rate",
+    )
+    if min_reward_daily_rate < 0:
+        warnings.append("query_defaults.min_reward_daily_rate 不能为负，回退 0.0")
+        min_reward_daily_rate = 0.0
 
     query_defaults = QueryDefaults(
         window_days=_coerce_int(qd_raw.get("window_days", 10), 10, warnings, "query_defaults.window_days"),
@@ -617,6 +649,7 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
         prob_max=prob_max,
         prob_side=prob_side,
         require_consecutive=require_consecutive,
+        min_reward_daily_rate=min_reward_daily_rate,
     )
 
     return MarketScreenConfig(
@@ -646,6 +679,10 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
         binary_only=binary_only,
         persist_non_passed=persist_non_passed,
         notify_enabled=notify_enabled,
+        reward_min_daily_rate=reward_min_daily_rate,
+        reward_tier_low_min=tier_low,
+        reward_tier_mid_min=tier_mid,
+        reward_tier_high_min=tier_high,
         query_defaults=query_defaults,
         errors=errors,
         warnings=warnings,

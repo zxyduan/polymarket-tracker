@@ -116,16 +116,25 @@ class MarketScreenUsecase:
             custom = cfg.custom_anchors if preset == cfg.main_preset else None
             anchors_by[preset] = resolve_anchors(preset, custom)
 
+        reward_min = float(getattr(cfg, "reward_min_daily_rate", 30.0))
+
         parsed: list[CandidateMarket] = []
         for raw in raws:
             row = parse_market(raw, now=now, tz_offset_hours=tz_offset)
             if row is None:
                 continue
+            # 奖励准入（硬规则）：无奖励/速率 NULL/低于准入线一律剔除。
+            if row.rewards_daily_rate is None or row.rewards_daily_rate < reward_min:
+                continue
             if row.volume_24h < float(cfg.min_value):
                 continue
             parsed.append(row)
 
-        parsed.sort(key=lambda r: r.volume_24h, reverse=True)
+        # 复合排序：奖励速率优先，同速率再按 24h 成交额倒序；TopN 在排序后截断。
+        parsed.sort(
+            key=lambda r: (r.rewards_daily_rate or 0.0, r.volume_24h),
+            reverse=True,
+        )
         parsed = parsed[: int(cfg.top_n)]
 
         rows: list[CandidateMarket] = []

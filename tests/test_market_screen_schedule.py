@@ -60,6 +60,11 @@ def test_defaults_fallback():
     assert qd.min_volume_24h == 50000.0 and qd.max_rank == 200
     assert qd.min_remaining_days == 31 and qd.prob_max == 0.15
     assert qd.prob_side == "minority" and qd.require_consecutive is False
+    assert qd.min_reward_daily_rate == 0.0
+    assert cfg.reward_min_daily_rate == 30.0
+    assert (
+        cfg.reward_tier_low_min, cfg.reward_tier_mid_min, cfg.reward_tier_high_min
+    ) == (30.0, 100.0, 300.0)
 
 
 def test_fatal_error_disables_with_errors():
@@ -125,3 +130,25 @@ def test_prob_side_invalid_falls_back():
     cfg = _resolve({"query_defaults": {"prob_side": "big"}})
     assert cfg.query_defaults.prob_side == "minority"
     assert cfg.warnings
+
+
+def test_reward_negative_min_falls_back():
+    cfg = _resolve({"reward": {"min_daily_rate": -5}})
+    assert cfg.reward_min_daily_rate == 30.0
+    assert any("min_daily_rate" in w for w in cfg.warnings)
+
+
+def test_reward_tiers_non_monotonic_fallback():
+    cfg = _resolve(
+        {"reward": {"tiers": {"low_min": 100, "mid_min": 30, "high_min": 300}}}
+    )
+    assert (
+        cfg.reward_tier_low_min, cfg.reward_tier_mid_min, cfg.reward_tier_high_min
+    ) == (30.0, 100.0, 300.0)
+    assert any("tiers" in w for w in cfg.warnings)
+
+
+def test_query_defaults_min_reward_invalid_falls_back():
+    cfg = _resolve({"query_defaults": {"min_reward_daily_rate": "abc"}})
+    assert cfg.query_defaults.min_reward_daily_rate == 0.0
+    assert any("min_reward_daily_rate" in w for w in cfg.warnings)

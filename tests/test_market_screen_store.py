@@ -13,7 +13,8 @@ from src.storage import Storage
 
 
 def _row(cid: str, run_date: str, rank: int, vol: float, prob: float,
-         remain: int, passed: int = 1) -> CandidateMarket:
+         remain: int, passed: int = 1,
+         reward_rate: float | None = None, reward_asset: str = "") -> CandidateMarket:
     return CandidateMarket(
         run_date=run_date, condition_id=cid, slug=f"slug-{cid}", question=f"Q {cid}",
         outcomes_json='["Yes","No"]', end_date_iso="2027-12-31", end_date_raw="",
@@ -22,6 +23,7 @@ def _row(cid: str, run_date: str, rank: int, vol: float, prob: float,
         horizon_preset="balanced", threshold_lo=0.02, horizon_pass=passed,
         pass_strict=passed, pass_balanced=passed, pass_loose=passed,
         screen_passed=passed, screen_reason="pass", collected_ts=0.0,
+        rewards_daily_rate=reward_rate, rewards_asset=reward_asset,
     )
 
 
@@ -109,7 +111,8 @@ async def test_persistent_hit_and_streak(db):
     # 仅给 0xa 第三天补一行：0xa 三日连续，0xb 只在窗口内两日
     await db.replace_screen_day(
         "2026-11-11",
-        [_row("0xa", "2026-11-11", 1, 60000, 0.012, 400)],
+        [_row("0xa", "2026-11-11", 1, 60000, 0.012, 400,
+              reward_rate=150.0, reward_asset="USDC.e")],
         _meta("2026-11-11", 1, 1),
     )
 
@@ -120,6 +123,8 @@ async def test_persistent_hit_and_streak(db):
     )
     assert [r["condition_id"] for r in hit] == ["0xa"]
     assert hit[0]["hit_days"] == 3
+    assert hit[0]["latest_rewards_daily_rate"] == pytest.approx(150.0)
+    assert hit[0]["latest_rewards_asset"] == "USDC.e"
 
     streak = await db.query_persistent_rows(
         start_date="2026-11-09", end_date="2026-11-11", max_rank=200,
@@ -127,6 +132,8 @@ async def test_persistent_hit_and_streak(db):
         prob_max=0.15, prob_side="minority", require_consecutive=True,
     )
     assert streak[0]["max_streak"] == 3
+    assert streak[0]["latest_rewards_daily_rate"] == pytest.approx(150.0)
+    assert streak[0]["latest_rewards_asset"] == "USDC.e"
 
 
 async def test_persistent_prob_side_yes(db):
@@ -228,3 +235,100 @@ async def test_store_persistent_query_maps_dto(store, db):
     assert row.minority_prob == pytest.approx(0.012)
     assert row.max_streak is None  # 非严格连续路径不填充
     assert result.warnings == []
+
+
+# ── 奖励字段落库回读与读侧筛选 ──────────────────────────────────────────────
+
+
+async def test_screen_daily_roundtrip_reward(db):
+    d1 = "2026-11-10"
+    await db.replace_screen_day(
+        d1,
+        [_row("0xa", d1, 1, 60000, 0.01, 400, reward_rate=120.0, reward_asset="USDC.e")],
+        _meta(d1, 1, 1),
+    )
+    rows = await db.list_screen_daily(d1)
+    assert rows[0]["rewards_daily_rate"] == pytest.approx(120.0)
+    assert rows[0]["rewards_asset"] == "USDC.e"
+
+
+async def test_persistent_reward_filter_and_dto(store, db):
+    d1 = "2026-11-10"
+    await db.replace_screen_day(
+        d1,
+        [
+            _row("0xa", d1, 1, 60000, 0.01, 400, reward_rate=120.0, reward_asset="USDC.e"),
+            _row("0xb", d1, 2, 55000, 0.01, 400, reward_rate=10.0, reward_asset="pUSD"),
+            _row("0xc", d1, 3, 55000, 0.01, 400),  # 历史 NULL
+        ],
+        _meta(d1, 3, 1),
+    )
+    result = await store.query_persistent_candidates(
+        end_date=d1, window_days=1, min_hit_days=1, min_volume_24h=1.0,
+        min_remaining_days=1, prob_max=0.15, min_reward_daily_rate=30.0,
+    )
+    assert [r.condition_id for r in result.rows] == ["0xa"]
+    row = result.rows[0]
+    assert row.latest_rewards_daily_rate == pytest.approx(120.0)
+    assert row.latest_rewards_asset == "USDC.e"
+
+
+async def test_reward_tier_maps_floor(store, db):
+    d1 = "2026-11-10"
+    await db.replace_screen_day(
+        d1,
+        [
+            _row("0xa", d1, 1, 60000, 0.01, 400, reward_rate=350.0, reward_asset="USDC.e"),
+            _row("0xb", d1, 2, 55000, 0.01, 400, reward_rate=120.0, reward_asset="pUSD"),
+        ],
+        _meta(d1, 2, 1),
+    )
+    high = await store.query_persistent_candidates(
+        end_date=d1, window_days=1, min_hit_days=1, min_volume_24h=1.0,
+        min_remaining_days=1, prob_max=0.15, reward_tier="high",
+    )
+    assert [r.condition_id for r in high.rows] == ["0xa"]
+
+
+async def test_sort_mode_reward_prefers_rate(store, db):
+    d1 = "2026-11-10"
+    await db.replace_screen_day(
+        d1,
+        [
+            _row("0xa", d1, 1, 60000, 0.01, 200, reward_rate=120.0),
+            _row("0xb", d1, 2, 55000, 0.01, 400, reward_rate=300.0),
+        ],
+        _meta(d1, 2, 1),
+    )
+    result = await store.query_persistent_candidates(
+        end_date=d1, window_days=1, min_hit_days=1, min_volume_24h=1.0,
+        min_remaining_days=1, prob_max=0.15, sort_mode="reward",
+    )
+    # 奖励 300 在前（0xb），即使其剩余天数更短。
+    assert [r.condition_id for r in result.rows] == ["0xb", "0xa"]
+
+
+async def test_invalid_sort_and_tier_warn_fallback(store, db):
+    d1 = "2026-11-10"
+    await db.replace_screen_day(
+        d1, [_row("0xa", d1, 1, 60000, 0.01, 400, reward_rate=120.0)],
+        _meta(d1, 1, 1),
+    )
+    result = await store.query_persistent_candidates(
+        end_date=d1, window_days=1, min_hit_days=1, min_volume_24h=1.0,
+        min_remaining_days=1, prob_max=0.15,
+        sort_mode="weird", reward_tier="gold",
+    )
+    text = " ".join(result.warnings)
+    assert "sort_mode" in text and "reward_tier" in text
+    assert len(result.rows) == 1
+
+
+async def test_init_reward_columns_idempotent(tmp_path):
+    path = str(tmp_path / "migration.db")
+    first = Storage(path)
+    await first.init()
+    await first.close()
+    second = Storage(path)
+    await second.init()  # 重复 ALTER 不报错
+    await second.close()

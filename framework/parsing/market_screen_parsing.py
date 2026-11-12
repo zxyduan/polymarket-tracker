@@ -25,6 +25,12 @@ PRESET_ANCHORS: dict[str, tuple[tuple[int, float], ...]] = {
 
 PRESETS: tuple[str, ...] = ("strict", "balanced", "loose")
 
+# 奖励抵押代币地址（小写）→ 符号；未命中地址兜底存小写原始地址。
+_REWARD_ASSET_SYMBOLS: dict[str, str] = {
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": "USDC.e",
+    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": "pUSD",
+}
+
 
 @dataclass(frozen=True)
 class PresetEvaluation:
@@ -68,6 +74,27 @@ def _to_float(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def _parse_rewards(raw: dict[str, object]) -> tuple[float | None, str]:
+    """从 clobRewards 提取每日奖励速率与代币标识；缺失/脏数据返回 (None, "")。
+
+    兼容 list 与字符串化 JSON 数组；多条取首条；已知地址映射符号，
+    未知地址兜底存小写地址。准入剔除由 usecase 判定，本层不丢行。
+    """
+    try:
+        entries = _json_list(raw.get("clobRewards"))
+        if not entries:
+            return None, ""
+        first = entries[0]
+        if not isinstance(first, dict):
+            return None, ""
+        rate = _to_float(first.get("rewardsDailyRate"))
+        address = str(first.get("assetAddress") or "").strip().lower()
+        asset = _REWARD_ASSET_SYMBOLS.get(address, address)
+        return rate, asset
+    except Exception:  # 奖励为附加字段：任何解析异常都不影响主行
+        return None, ""
 
 
 def _parse_date_part(value: Any) -> str | None:
@@ -209,6 +236,29 @@ def evaluate_presets(
     )
 
 
+def classify_reward_tier(
+    rate: float | None,
+    *,
+    low_min: float,
+    mid_min: float,
+    high_min: float,
+) -> str | None:
+    """按每日速率分档，返回 "high" / "mid" / "low"；None 或低于 low_min 返回 None。
+
+    区间左闭右开：high >= high_min；mid ∈ [mid_min, high_min)；
+    low ∈ [low_min, mid_min)。阈值由配置注入，本函数不读全局配置。
+    """
+    if rate is None or not math.isfinite(rate):
+        return None
+    if rate >= high_min:
+        return "high"
+    if rate >= mid_min:
+        return "mid"
+    if rate >= low_min:
+        return "low"
+    return None
+
+
 # ── 报文解析 ───────────────────────────────────────────────────────────────
 
 
@@ -274,6 +324,8 @@ def parse_market(
     slug = str(raw.get("slug") or "").strip()
     question = str(raw.get("question") or raw.get("title") or "").strip()
 
+    rewards_rate, rewards_asset = _parse_rewards(raw)
+
     return CandidateMarket(
         run_date="",
         condition_id=cid,
@@ -298,4 +350,6 @@ def parse_market(
         screen_passed=0,
         screen_reason="",
         collected_ts=0.0,
+        rewards_daily_rate=rewards_rate,
+        rewards_asset=rewards_asset,
     )
