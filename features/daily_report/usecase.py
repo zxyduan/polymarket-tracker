@@ -95,6 +95,9 @@ class DailyReportUsecase:
             row: dict[str, Any] = {"condition_id": cid, "slug_id": label}
             for d in windows:
                 row[f"shares_{d}d"] = max(0.0, agg[cid].get(d, 0.0))
+            if 7 in windows:
+                # 7 天平均量：以 7 天窗口份额除以 7（窗口不含 7 时不输出）
+                row["avg_7d"] = float(row.get("shares_7d", 0.0) or 0.0) / 7.0
             out.append(row)
         self._health["missing_markets"] = len(missing)
 

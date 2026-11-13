@@ -45,7 +45,7 @@ from framework.parsing.snapshot_parsing import (  # noqa: E402
 # ── 常量（与参考源一致，禁止改动口径）────────────────────────────────────
 
 BUCKET_SIZE_SEC = 7200  # 2 小时一个桶
-RETENTION_DAYS = 90  # 保留 90 天
+# 快照保留期不再硬编码：由 Settings 注入 snapshot.retention_days（默认 30）。
 
 WINDOW_DRAWDOWN_DAYS = 7  # 回撤窗口
 WINDOW_PERCENTILE_DAYS = 30  # 分位窗口
@@ -75,6 +75,7 @@ class SnapshotCollector:
         timeout: float = 15.0,
         price_fidelity_minutes: int = 60,
         volume_tracker: Any | None = None,
+        retention_days: int = 30,
     ) -> None:
         self._storage = storage
         self._gamma = httpx.AsyncClient(base_url=gamma_host, timeout=timeout)
@@ -82,6 +83,7 @@ class SnapshotCollector:
         self._fidelity = price_fidelity_minutes
         self._resolved: dict[str, tuple[str, str]] = {}
         self._volume_tracker = volume_tracker
+        self._retention_days = retention_days
 
     async def aclose(self) -> None:
         await self._gamma.aclose()
@@ -282,7 +284,7 @@ class SnapshotCollector:
         )
 
         # 11. 清理旧数据
-        await self._storage.prune_snapshots(RETENTION_DAYS)
+        await self._storage.prune_snapshots(self._retention_days)
         logger.info(
             "snapshot collected cid=%s bucket=%s regime=%s",
             condition_id[:8],

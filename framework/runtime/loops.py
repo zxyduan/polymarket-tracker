@@ -73,25 +73,44 @@ async def funnel_watch_loop(
             )
 
 
-async def prune_loop(storage: Storage, settings: Settings, stop_event: asyncio.Event) -> None:
-    """每日清理：过期事件、过期推送记录、过期快照、过期筛选候选，并 VACUUM。"""
+async def prune_loop(
+    storage: Storage, settings: Settings, stop_event: asyncio.Event
+) -> None:
+    """滚动清理：启动即跑、固定间隔；VACUUM 每 N 轮一次。"""
     events_days = int(settings.get("events.retention_days", 180))
-    notifications_days = int(settings.get("events.notifications_retention_days", 30))
+    notifications_days = int(
+        settings.get("events.notifications_retention_days", 30)
+    )
     snapshot_days = int(settings.snapshot.get("retention_days", 90))
     screen_days = int(settings.market_screen.get("retention_days", 30))
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=86400)
-        except asyncio.TimeoutError:
-            await storage.prune_events(events_days)
-            await storage.prune_notifications(notifications_days)
-            await storage.prune_snapshots(snapshot_days)
-            await storage.prune_screen(screen_days)
+    interval = int(settings.get("prune_interval_seconds", 3600))
+    vacuum_every = int(settings.get("vacuum_every_n_runs", 24))
+
+    async def _prune(do_vacuum: bool) -> None:
+        await storage.prune_events(events_days)
+        await storage.prune_notifications(notifications_days)
+        await storage.prune_snapshots(snapshot_days)
+        await storage.prune_screen(screen_days)
+        if do_vacuum:
             await storage.vacuum()
+
+    run_count = 0
+    while not stop_event.is_set():
+        run_count += 1
+        do_vacuum = run_count % vacuum_every == 0
+        try:
+            await _prune(do_vacuum)
             logger.info(
-                "数据清理完成（事件 %d 天 / 推送记录 %d 天 / 快照 %d 天 / 筛选 %d 天 / 已 VACUUM）",
-                events_days, notifications_days, snapshot_days, screen_days,
+                "数据清理完成 run=%d vacuum=%s（事件%d/推送%d/快照%d/筛选%d）",
+                run_count, do_vacuum, events_days, notifications_days,
+                snapshot_days, screen_days,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("数据清理失败 run=%d: %s", run_count, exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            continue
 
 
 # ── 市场快照采集与推送 ──────────────────────────────────────────────────

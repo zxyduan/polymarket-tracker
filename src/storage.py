@@ -560,20 +560,90 @@ class Storage:
                 added += 1
         return added
 
-    async def add_wallet(self, address: str, label: str = "") -> tuple[bool, str]:
-        """新增监控地址，返回(是否新增, 结果说明)。"""
+    async def sync_wallets_from_config(
+        self, seeds: list[WatchlistSeed]
+    ) -> dict[str, int]:
+        """以配置集合为目标态做三态对账，返回各动作计数。
+
+        配置有/DB 无 -> 插入 active=1；配置有/DB 有 -> 对齐 active=1 并更新
+        label；配置无/DB active=1 -> 停用（软删）。
+        """
+        target = {seed.address.lower(): seed.label for seed in seeds}
+        existing = {
+            row["address"]: row
+            for row in await self._fetchall("SELECT * FROM wallets")
+        }
+        inserted = updated = deactivated = 0
+
+        for address, label in target.items():
+            row = existing.get(address)
+            if row is None:
+                await self._execute(
+                    "INSERT INTO wallets(address, proxy_address, label, active, created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (address, None, label, 1, _now()),
+                )
+                inserted += 1
+            else:
+                if not row["active"] or row["label"] != label:
+                    await self._execute(
+                        "UPDATE wallets SET active=1, label=? WHERE address=?",
+                        (label, address),
+                    )
+                updated += 1
+
+        for address, row in existing.items():
+            if address not in target and row["active"]:
+                await self._execute(
+                    "UPDATE wallets SET active=0 WHERE address=?", (address,)
+                )
+                deactivated += 1
+
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "deactivated": deactivated,
+        }
+
+    async def add_wallet(
+        self, address: str, label: str = ""
+    ) -> tuple[bool, str, str]:
+        """新增监控地址；地址存在但已停用则重新激活。
+
+        返回 (是否变更, 说明, 动作类型)；第三项用于落盘失败时精确回滚：
+        "inserted" 新插入 / "reactivated" 重新激活 / "noop" 已在名单无变更。
+        """
         address = address.lower()
         existing = await self._fetchone(
-            "SELECT id FROM wallets WHERE address=?", (address,)
+            "SELECT id, active, label FROM wallets WHERE address=?", (address,)
         )
         if existing is not None:
-            return False, "该地址已在监控名单中"
+            if existing["active"]:
+                return False, "该地址已在监控名单中", "noop"
+            new_label = label or existing["label"] or ""
+            await self._execute(
+                "UPDATE wallets SET active=1, label=? WHERE address=?",
+                (new_label, address),
+            )
+            return True, "已重新加入监控", "reactivated"
         await self._execute(
             "INSERT INTO wallets(address, proxy_address, label, active, created_at) "
             "VALUES(?,?,?,?,?)",
             (address, None, label, 1, _now()),
         )
-        return True, "已加入监控"
+        return True, "已加入监控", "inserted"
+
+    async def reactivate_wallet(self, address: str) -> None:
+        """重新激活指定地址（/remove 回写失败回滚用）。"""
+        await self._execute(
+            "UPDATE wallets SET active=1 WHERE address=?", (address.lower(),)
+        )
+
+    async def delete_wallet(self, address: str) -> None:
+        """物理删除钱包记录（仅用于回滚新插入；正常移除仍用 remove_wallet 软删）。"""
+        await self._execute(
+            "DELETE FROM wallets WHERE address=?", (address.lower(),)
+        )
 
     async def remove_wallet(self, address: str) -> tuple[bool, str]:
         """软删除（停用）监控地址。"""

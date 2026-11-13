@@ -77,6 +77,8 @@ class DailyReportRenderer:
                 f"{d}天 {_fmt_shares(float(row.get(f'shares_{d}d', 0.0) or 0.0))}"
                 for d in windows_days
             ]
+            if "avg_7d" in row:
+                parts.append(f"7日均 {_fmt_shares(float(row['avg_7d']))}")
             market_lines.append(f"{_daily_index(i)} {label}\n   " + "｜".join(parts))
 
         start_bucket = now_bucket - max(windows_days) * 86400

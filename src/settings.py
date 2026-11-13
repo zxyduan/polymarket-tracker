@@ -105,6 +105,99 @@ def _toml_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _yaml_double_quote(value: str) -> str:
+    """把字符串序列化为 YAML 双引号标量。
+
+    处理反斜杠、双引号与常见控制字符；普通 UTF-8（含中文）原样保留。
+    """
+    escapes = {
+        "\\": "\\\\",
+        '"': '\\"',
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+        "\0": "\\0",
+    }
+    body = "".join(escapes.get(ch, ch) for ch in str(value))
+    return f'"{body}"'
+
+
+def _find_watchlist_span(lines: list[str]) -> tuple[int, int] | None:
+    """返回顶层 watchlist 段的 [start, end) 行索引；段缺失返回 None。
+
+    先定位 watchlist 之后第一个行首非空白、且非注释的行（下一个顶层 key），
+    再把 end 向前回退，跳过段尾连续的空行与注释——它们属于段间/下一段，
+    回写时保留，避免误删下一段的前置注释。
+    """
+    start = next(
+        (i for i, ln in enumerate(lines) if ln.rstrip().startswith("watchlist:")),
+        None,
+    )
+    if start is None:
+        return None
+    next_key = len(lines)
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if (
+            ln.strip()
+            and not ln.lstrip().startswith("#")
+            and not ln[:1].isspace()
+        ):
+            next_key = j
+            break
+    # 回退：next_key 之前的空行与注释（段间/下一段前置注释）不纳入替换
+    end = next_key
+    while end > start + 1 and (
+        not lines[end - 1].strip()
+        or lines[end - 1].lstrip().startswith("#")
+    ):
+        end -= 1
+    return start, end
+
+
+def save_watchlist_yaml(
+    path: str | Path, wallets: list[dict[str, Any]]
+) -> None:
+    """把当前 active 钱包文本级回写 config.yaml 的 watchlist 段。
+
+    仅替换该段，其余内容（含注释、其他配置）原样保留；写前生成 .bak；
+    watchlist 段缺失时在文件顶部插入。空名单写 'watchlist: []'。
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    lines = text.splitlines()
+    trailing_newline = text.endswith("\n")
+
+    if not wallets:
+        new_block = ["watchlist: []"]
+    else:
+        new_block = ["watchlist:"]
+        for w in wallets:
+            new_block.append(
+                f"  - address: {_yaml_double_quote(str(w['address']))}"
+            )
+            new_block.append(
+                f"    label: {_yaml_double_quote(str(w.get('label', '') or ''))}"
+            )
+
+    span = _find_watchlist_span(lines)
+    if span is None:
+        block = list(new_block)
+        if lines and lines[0].strip():
+            block.append("")  # 与原首行之间空一行
+        rebuilt = block + lines
+    else:
+        start, end = span
+        rebuilt = lines[:start] + new_block + lines[end:]
+
+    if p.exists():
+        p.with_suffix(p.suffix + ".bak").write_text(text, encoding="utf-8")
+    output = "\n".join(rebuilt)
+    if trailing_newline:
+        output += "\n"
+    p.write_text(output, encoding="utf-8")
+
+
 @dataclass
 class Settings:
     """运行期配置（环境变量 + config.yaml）。"""
@@ -150,6 +243,17 @@ class Settings:
                     WatchlistSeed(address=address, label=str(item.get("label", "")).strip())
                 )
         return seeds
+
+    def watchlist_target(self) -> tuple[bool, list[WatchlistSeed]]:
+        """返回 (配置是否有效, 种子)。
+
+        键缺失或显式 null -> 无效，调用方 fail fast、不做停用；
+        显式空列表 -> 有效且为空（全停）；非空 -> 正常。
+        """
+        raw_val = self.raw.get("watchlist")
+        if "watchlist" not in self.raw or raw_val is None:
+            return False, []
+        return True, self.watchlist_seeds
 
     @property
     def markets(self) -> list[MarketEntry]:

@@ -1,6 +1,6 @@
 # market 交易员监控配置
 # 配置说明：watchlist 支持配置多个交易员地址，推荐填写 market 个人主页/排行榜上的地址（代理钱包）。
-# 运行后也可通过 Telegram 指令 /add、/remove 动态增删，动态名单存入 SQLite，本文件只做启动种子。
+# 运行后也可通过 Telegram 指令 /add、/remove 动态增删，改动会同步回写本文件，重启后据此恢复。
 
 watchlist:
   - address: "0x0000000000000000000000000000000000000000"
@@ -46,8 +46,12 @@ logging:
 
 # 事件库保留时长
 events:
-  retention_days: 180
-  notifications_retention_days: 30   # 推送记录保留时长
+  retention_days: 1                    # 成交事件仅保留 24 小时
+  notifications_retention_days: 1      # 推送记录同步保留 24 小时
+
+# 数据清理调度
+prune_interval_seconds: 3600   # 滚动清理间隔（秒），启动即清一次
+vacuum_every_n_runs: 24        # 每 N 轮清理执行一次 VACUUM（约每日）
 
 # 展示时区（时间 UTC+8）
 display:
@@ -72,7 +76,7 @@ snapshot_push:
 snapshot:
   bucket_seconds: 7200         # 时间桶长度（2h，与参考源一致，勿改）
   collect_interval_seconds: 600  # 采集间隔（秒），默认 10 分钟；桶内重试 + 漏桶自愈依赖该间隔
-  retention_days: 90           # 快照保留天数
+  retention_days: 30           # 快照保留天数（支撑日报 30 天窗口与分位）
   price_fidelity_minutes: 60   # 价格历史采样粒度（分钟）
   wall_min_notional: 100.0     # 订单簿"墙"阈值（USDC）
   request_timeout_seconds: 15

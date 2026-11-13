@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 
 from src.core.address import is_address
 from src.core.renderer import html_escape
+from src.settings import save_watchlist_yaml
+
+logger = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "<b>market 交易员监控</b>\n"
@@ -28,11 +33,20 @@ class CommandHandler:
         health: dict[str, Any],
         *,
         digest_manager: Any = None,
+        config_path: str | Path | None = None,
     ) -> None:
         self.storage = storage
         self.health = health
         # digest 摘要管理器（可选）：/remove 时清理该地址的未发摘要桶
         self.digest_manager = digest_manager
+        self._config_path = config_path
+
+    async def _persist_watchlist(self) -> None:
+        """以 DB 当前 active 列表回写 config.yaml；未配置路径则跳过。"""
+        if self._config_path is None:
+            return
+        wallets = await self.storage.list_wallets(active_only=True)
+        save_watchlist_yaml(self._config_path, wallets)
 
     async def __call__(self, text: str, chat_id: int) -> str | None:
         parts = text.strip().split()
@@ -61,7 +75,17 @@ class CommandHandler:
         if not is_address(address):
             return "地址格式错误，请提供合法的 0x 开头 40 位地址"
         label = " ".join(args[1:]).strip()
-        ok, message = await self.storage.add_wallet(address, label)
+        ok, message, action = await self.storage.add_wallet(address, label)
+        if ok:
+            try:
+                await self._persist_watchlist()
+            except Exception as exc:  # noqa: BLE001  落盘失败：按操作类型精确回滚
+                if action == "inserted":
+                    await self.storage.delete_wallet(address)  # 新插入：物理删除
+                else:
+                    await self.storage.remove_wallet(address)  # 重新激活：恢复停用
+                logger.error("watchlist 回写失败，已回滚: %s", exc)
+                return f"⚠️ 配置落盘失败，已撤销本次操作：{exc}"
         return f"{'✅' if ok else 'ℹ️'} {message}"
 
     async def _remove(self, args: list[str]) -> str:
@@ -71,9 +95,16 @@ class CommandHandler:
         if not is_address(address):
             return "地址格式错误"
         ok, message = await self.storage.remove_wallet(address)
-        if ok and self.digest_manager is not None:
-            # 清理该地址未到期的摘要桶（global 模式为 no-op）
-            await self.digest_manager.discard_wallet(address)
+        if ok:
+            if self.digest_manager is not None:
+                # 清理该地址未到期的摘要桶（global 模式为 no-op；不可恢复）
+                await self.digest_manager.discard_wallet(address)
+            try:
+                await self._persist_watchlist()
+            except Exception as exc:  # noqa: BLE001  落盘失败：重新激活（digest 桶不恢复）
+                await self.storage.reactivate_wallet(address)
+                logger.error("watchlist 回写失败，已回滚: %s", exc)
+                return f"⚠️ 配置落盘失败，已撤销本次操作：{exc}"
         return f"{'✅' if ok else 'ℹ️'} {message}"
 
     async def _list(self) -> str:

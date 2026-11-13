@@ -78,9 +78,13 @@ async def build_app(config_path: str) -> AppHandle:
     storage = Storage("data/monitor.db")
     await storage.init()
     h.storage = storage
-    seeded = await storage.seed_wallets(settings.watchlist_seeds)
-    if seeded:
-        logger.info("配置种子新增监控地址 %d 个", seeded)
+    valid, seeds = settings.watchlist_target()
+    if not valid:
+        raise RuntimeError(
+            "config.yaml 的 watchlist 缺失或为 null；请显式填写地址或写 watchlist: []"
+        )
+    reconciled = await storage.sync_wallets_from_config(seeds)
+    logger.info("启动对账完成: %s", reconciled)
 
     endpoints = settings.section("endpoints")
     polling = settings.section("polling")
@@ -142,6 +146,7 @@ async def build_app(config_path: str) -> AppHandle:
         clob_host=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
         timeout=float(snapshot_cfg.get("request_timeout_seconds", 15)),
         price_fidelity_minutes=int(snapshot_cfg.get("price_fidelity_minutes", 60)),
+        retention_days=int(snapshot_cfg.get("retention_days", 30)),
     )
     h.snap_collector = snap_collector
 
@@ -275,7 +280,12 @@ async def build_app(config_path: str) -> AppHandle:
         logger.warning("推送通道均未启用，交易员告警不推送")
     if tg_api is not None and auth is not None:
         bot = BotRunner(tg_api, storage, auth)
-        command_handler = CommandHandler(storage, health, digest_manager=pipeline.digest)
+        command_handler = CommandHandler(
+            storage,
+            health,
+            digest_manager=pipeline.digest,
+            config_path=settings.config_path,
+        )
         tasks.append(asyncio.create_task(supervised(
             "bot_updates", lambda: bot.run_updates(command_handler, stop_event), stop_event)))
 

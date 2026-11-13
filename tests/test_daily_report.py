@@ -441,3 +441,27 @@ def test_daily_result_reply_five_codes():
     assert daily_result_reply("sent_dup").startswith("ℹ️")
     assert daily_result_reply("send_failed").startswith("❌")
     assert daily_result_reply("weird") == "日报结果：weird"
+
+
+def test_renderer_avg_7d():
+    r = DailyReportRenderer()
+    rows = [{
+        "condition_id": "0xa", "slug_id": "A",
+        "shares_1d": 1200.0, "shares_7d": 8400.0, "shares_30d": 30000.0,
+        "avg_7d": 1200.0,
+    }]
+    msg = r.render(
+        rows, windows_days=[1, 7, 30], now_bucket=R0,
+        tz_offset_hours=8, top_n=0,
+    )
+    assert "7日均 1,200" in msg.body
+    # 窗口不含 7：usecase 不会写 avg_7d，渲染自然降级
+    rows2 = [{
+        "condition_id": "0xb", "slug_id": "B",
+        "shares_3d": 100.0, "shares_9d": 200.0,
+    }]
+    msg2 = r.render(
+        rows2, windows_days=[3, 9], now_bucket=R0,
+        tz_offset_hours=8, top_n=0,
+    )
+    assert "7日均" not in msg2.body
