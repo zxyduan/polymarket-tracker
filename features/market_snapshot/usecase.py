@@ -87,6 +87,13 @@ class SnapshotPushUsecase:
                 continue
             cids.append(resolved[0])
 
+        # 1.5) 所有市场 cid 均解析失败：直接 empty，不回退全表查询，
+        #      避免 Gamma 整体不可用时把已下线市场的旧行当成快照推出去
+        if not cids:
+            self._health["empty_skipped"] += 1
+            logger.warning("快照跳过：所有市场 cid 解析失败 bucket=%s", now_bucket)
+            return "empty"
+
         # 2) 逐市场 backfill，失败仅告警
         for cid in cids:
             try:
@@ -94,8 +101,10 @@ class SnapshotPushUsecase:
             except Exception as exc:
                 logger.warning("backfill %s 失败: %s", cid, exc)
 
-        # 3) 最新完整桶
-        rows = await self._query.latest_complete_buckets(now_bucket)
+        # 3) 最新完整桶（仅当前 catalog 已解析的 cid，过滤已下线市场）
+        rows = await self._query.latest_complete_buckets(
+            now_bucket, condition_ids=cids or None
+        )
         self._health["last_rows"] = len(rows)
 
         # 4) 无数据：不写成功 state，避免调度层误判“已推送”

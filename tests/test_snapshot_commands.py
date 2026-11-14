@@ -20,7 +20,9 @@ class FakeCollector:
 
 
 class FakeStorage:
-    async def latest_complete_buckets(self, now_bucket: int) -> list[dict]:
+    async def latest_complete_buckets(
+        self, now_bucket: int, condition_ids: list[str] | None = None
+    ) -> list[dict]:
         return []
 
 

@@ -143,7 +143,7 @@ class _SnapCollector:
 
 class _SnapQuery:
     def __init__(self, rows): self._rows = rows
-    async def latest_complete_buckets(self, now_bucket): return self._rows
+    async def latest_complete_buckets(self, now_bucket, condition_ids=None): return self._rows
 
 
 class _SnapRenderer:

@@ -949,21 +949,31 @@ class Storage:
         return [str(row["condition_id"]) for row in rows]
 
     async def latest_complete_buckets(
-        self, now_bucket: int
+        self,
+        now_bucket: int,
+        condition_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """取每个市场最近一个**已闭合**桶（bucket_ts < now_bucket）。
 
-        返回按 bucket_ts 升序（旧→新）。
+        condition_ids 非空时仅返回该白名单内的市场，避免已下线市场的
+        历史冻结行污染快照；返回按 bucket_ts 升序（旧→新）。
         """
-        rows = await self._fetchall(
-            "SELECT s.* FROM market_snapshots s "
-            "JOIN (SELECT condition_id, MAX(bucket_ts) AS max_ts "
-            "      FROM market_snapshots WHERE bucket_ts < ? "
-            "      GROUP BY condition_id) m "
-            "ON s.condition_id = m.condition_id AND s.bucket_ts = m.max_ts "
+        sql = [
+            "SELECT s.* FROM market_snapshots s ",
+            "JOIN (SELECT condition_id, MAX(bucket_ts) AS max_ts ",
+            "      FROM market_snapshots WHERE bucket_ts < ? ",
+        ]
+        params: list[Any] = [now_bucket]
+        if condition_ids:
+            placeholders = ",".join("?" for _ in condition_ids)
+            sql.append(f"      AND condition_id IN ({placeholders}) ")
+            params.extend(cid.lower() for cid in condition_ids)
+        sql.extend([
+            "      GROUP BY condition_id) m ",
+            "ON s.condition_id = m.condition_id AND s.bucket_ts = m.max_ts ",
             "ORDER BY s.bucket_ts ASC",
-            (now_bucket,),
-        )
+        ])
+        rows = await self._fetchall(" ".join(sql), tuple(params))
         return [dict(row) for row in rows]
 
     async def get_snap_baseline(self, condition_id: str, bucket_ts: int) -> float | None:

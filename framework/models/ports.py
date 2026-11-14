@@ -29,7 +29,9 @@ class SnapshotQuery(Protocol):
     待 P5 落地）；windows_sum 已返回 WindowSum DTO。
     """
 
-    async def latest_complete_buckets(self, now_bucket: int) -> list[dict]: ...
+    async def latest_complete_buckets(
+        self, now_bucket: int, condition_ids: list[str] | None = None
+    ) -> list[dict]: ...
 
     async def windows_sum(
         self, *, start_ts: int, end_ts: int, cid: str | None = None

@@ -49,7 +49,7 @@ class Query:
         if val is None:
             return []
         return [_WSum("cid-a", float(val)), _WSum("cid-b", float(val) * 2)]
-    async def latest_complete_buckets(self, now): return []
+    async def latest_complete_buckets(self, now, condition_ids=None): return []
 
 
 class Renderer:

@@ -27,7 +27,7 @@ class FakeCollector:
 
 class FakeQuery:
     def __init__(self, rows): self._rows = rows
-    async def latest_complete_buckets(self, now_bucket): return self._rows
+    async def latest_complete_buckets(self, now_bucket, condition_ids=None): return self._rows
 
 
 class FakeRenderer:
@@ -94,13 +94,28 @@ def test_render_none_is_observable():
     assert uc._hash.recorded == []
 
 
+class NoneResolveCollector(FakeCollector):
+    async def resolve_market(self, slug):
+        return None
+
+
+def test_all_resolve_failed_returns_empty():
+    uc = _build(collector=NoneResolveCollector())
+    status = asyncio.run(uc.run())
+    assert status == "empty"
+    assert uc._health["empty_skipped"] == 1
+    assert uc._collector.backfilled == []
+    assert uc._hash.recorded == []
+
+
 class DynamicQuery(FakeQuery):
     def __init__(self, rows):
         super().__init__(rows)
         self.seen_now = None
 
-    async def latest_complete_buckets(self, now_bucket):
+    async def latest_complete_buckets(self, now_bucket, condition_ids=None):
         self.seen_now = now_bucket
+        self.seen_condition_ids = condition_ids
         return self._rows
 
 
