@@ -56,6 +56,12 @@ def _build_ntfy(
         # 日报独立 topic：缺失即禁用日报 ntfy 通道，不回退 snapshot_topic/topic
         topic_key = "daily_topic"
         topic = str(ntfy_cfg.get("daily_topic", "")).strip()
+    elif kind == "watchlist_market":
+        # 白名单市场告警专用 topic；缺省回退通用 topic，不回退 snapshot/daily 专用 topic
+        topic_key = "market_topic"
+        topic = str(ntfy_cfg.get("market_topic", "")).strip() or str(
+            ntfy_cfg.get("topic", "")
+        ).strip()
     elif kind == "snapshot":
         topic_key = "snapshot_topic"
         topic = str(ntfy_cfg.get(topic_key, "")).strip() or str(

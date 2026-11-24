@@ -330,6 +330,35 @@ async def market_screen_loop(
             pass
 
 
+# ── 白名单市场奖励轮询 ──────────────────────────────────────────────────
+
+
+async def reward_watch_loop(
+    watch_uc: Any,
+    cids: set[str],
+    stop_event: asyncio.Event,
+    interval_seconds: int = 900,
+) -> None:
+    """固定间隔轮询清单市场奖励；启动先跑一轮建基线，之后对齐整点桶。
+
+    循环体异常由 `supervised` 监护退避重启；loop 内不吞异常。
+    """
+    if not cids:
+        logger.info("watchlist 清单为空，奖励轮询循环退出")
+        return
+    await watch_uc.run_round(cids)
+    while not stop_event.is_set():
+        now = int(time.time())
+        delay = interval_seconds - (now % interval_seconds)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay + 2)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        await watch_uc.run_round(cids)
+
+
 # ── 任务监护 ────────────────────────────────────────────────────────────
 
 

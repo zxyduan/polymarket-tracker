@@ -84,12 +84,17 @@ class PipelineRunner:
         storage: Storage,
         gamma: GammaClient,
         settings: Any,
+        *,
+        market_alert_queue: asyncio.Queue[StandardEvent] | None = None,
+        watchlist_cids: set[str] | None = None,
     ) -> None:
         self.in_queue = in_queue
         self.out_queue = out_queue
         self.storage = storage
         self.gamma = gamma
         self.settings = settings
+        self.market_alert_queue = market_alert_queue
+        self.watchlist_cids = watchlist_cids or set()
         self.aggregator: Aggregator | None = None
         # 批量摘要配置在启动时解析校验：非法值这里直接抛 ValueError，
         # 让服务启动失败暴露问题，而不是等任务被监护反复重启。
@@ -108,6 +113,8 @@ class PipelineRunner:
             "notional_none": 0,
             "notional_below": 0,
             "accepted": 0,
+            "market_alert_queued": 0,
+            "market_alert_drop": 0,
         }
 
     async def run(self) -> None:
@@ -163,6 +170,24 @@ class PipelineRunner:
                 if event.event_type not in allowed_types:
                     self.funnel["type_blocked"] += 1
                     continue
+                # 白名单市场成交旁路：命中清单的 TRADE 投递给 M2 用例；
+                # 入队后不 continue，事件继续走原有钱包维度过滤与聚合。
+                if (
+                    self.market_alert_queue is not None
+                    and self.watchlist_cids
+                    and event.event_type == "TRADE"
+                ):
+                    cid = (event.condition_id or "").strip().lower()
+                    if cid and cid in self.watchlist_cids:
+                        self.funnel["market_alert_queued"] += 1
+                        try:
+                            self.market_alert_queue.put_nowait(event)
+                        except asyncio.QueueFull:
+                            self.funnel["market_alert_drop"] += 1
+                            logger.warning(
+                                "market_alert 队列满，旁路丢弃 key=%s",
+                                event.dedupe_key,
+                            )
                 if event.event_type == "TRADE":
                     if event.notional is None:
                         self.funnel["notional_none"] += 1

@@ -11,7 +11,7 @@ from typing import Any
 from framework.adapters.legacy_collector import LegacyCollectorAdapter
 from framework.adapters.notifier_channel import NotifierChannel
 from framework.delivery.router import ChannelRouter
-from framework.delivery.targets import DeliveryTarget
+from framework.delivery.targets import LegacyProvider
 from framework.render.paginator import MessagePaginator
 from framework.runtime.module import FeatureModule, FeatureRuntime
 from framework.scheduler.guard import BodyHashGuard
@@ -24,12 +24,6 @@ from features.trader.usecase import TraderAlertUsecase, TraderConfig
 logger = logging.getLogger(__name__)
 
 
-class _LegacyProvider:
-    """适配旧 NotifierChannel：返回默认 target 使 router dispatch 不跳过。"""
-    def targets(self):
-        return [DeliveryTarget(channel="legacy_notifier", address="")]
-
-
 def build_runtime(*, storage: Any, collector: Any, catalog: Any,
                   snap_notifiers: list, daily_notifiers: list, trader_notifiers: list,
                   snap_renderer: Any, daily_renderer: Any, trader_renderer: Any,
@@ -39,9 +33,9 @@ def build_runtime(*, storage: Any, collector: Any, catalog: Any,
     cursor = StateStore(storage)
     guard = BodyHashGuard(cursor)
 
-    snap_router = ChannelRouter([NotifierChannel(n) for n in snap_notifiers], _LegacyProvider())
-    daily_router = ChannelRouter([NotifierChannel(n) for n in daily_notifiers], _LegacyProvider())
-    trader_router = ChannelRouter([NotifierChannel(n) for n in trader_notifiers], _LegacyProvider())
+    snap_router = ChannelRouter([NotifierChannel(n) for n in snap_notifiers], LegacyProvider())
+    daily_router = ChannelRouter([NotifierChannel(n) for n in daily_notifiers], LegacyProvider())
+    trader_router = ChannelRouter([NotifierChannel(n) for n in trader_notifiers], LegacyProvider())
 
     snap_uc = SnapshotPushUsecase(
         catalog=catalog, collector=LegacyCollectorAdapter(collector),

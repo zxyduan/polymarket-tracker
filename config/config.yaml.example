@@ -158,7 +158,8 @@ endpoints:
   polygonscan: "https://polygonscan.com"
 
 # 消息推送通道列表：可多平台同时启用（如 ntfy + telegram 一起推送）
-#   telegram：需要 BOT_TOKEN / SNAPSHOT_BOT_TOKEN（.env），支持 /指令 交互
+#   telegram：需要 BOT_TOKEN / SNAPSHOT_BOT_TOKEN / DAILY_BOT_TOKEN /
+#             MARKET_ALERT_BOT_TOKEN（环境变量），支持 /指令 交互
 #   ntfy：无需 Bot token，订阅端 App 按 topic 收推送；单向推送（无指令交互）
 # 后续扩展其他平台时在此列表上新增枚举即可（src/notify/factory.py）
 notify:
@@ -170,6 +171,7 @@ ntfy:
   server: "https://ntfy.sh"      # 或自建 https://ntfy.example.com
   topic: "polymarket-alerts"     # 交易员告警 topic（订阅端 App 需订阅同名 topic）
   snapshot_topic: "polymarket-snap"  # 快照总览 topic（缺省则用 topic）
+  market_topic: "polymarket-watch"   # 白名单市场告警 topic（缺省则回退 topic）
   access_token: ""               # 可选：私有 topic / 自建服务器鉴权（发布需 Bearer token）
   title_prefix: "market"     # 可选：推送标题前缀
   priority: ""                   # 可选：1-5（如 3=默认、4=高优先级）
@@ -185,4 +187,26 @@ safe_proxy:
 # P1 灰度开关
 p1:
   trader_enabled: true   # 交易推送新路径开关，出问题设 false 回退旧路径
+
+# ── 白名单市场告警（仅监控 markets.toml 清单内市场）─────────────────────
+# M1 奖励变化轮询告警；M2 清单市场成交实时合并推送。
+# Telegram 独立 Bot token 走环境变量 MARKET_ALERT_BOT_TOKEN（空 = Telegram 禁用，仅留 ntfy）。
+watchlist_alert:
+  enabled: true
+  reward:
+    enabled: true
+    watch_interval_seconds: 900      # [300,1800] 轮询间隔（秒）
+    alert_on_exit: true               # 奖励退出（速率归零 / 段消失）
+    alert_on_floor_break: true        # 跌破准入线（0 < 速率 < reward_min_daily_rate）
+    alert_on_decay_pct: true          # 相对降幅达阈值
+    decay_pct_threshold: 0.30         # (0,1] 降幅比例
+    alert_on_tier_drop: true          # 档位下滑（高→中→低）
+    alert_on_rebound: false           # 恢复在线：P1 仅记日志，不入推送
+    confirm_rounds: 1                 # exit / floor_break 连续命中轮数（≥1）
+    cooldown_seconds: 86400           # 同市场同事件冷却（秒，≥0）
+  trade:
+    enabled: true
+    merge_window_seconds: 30          # [5,300] 同市场合并窗口（秒）
+    max_events_per_message: 10        # 单条消息最多笔数（≥1），达上限提前推送
+    cross_link_dedup: true            # 跨链路重复成交抑制
 

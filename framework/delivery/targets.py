@@ -24,3 +24,13 @@ def telegram_chat(chat_id: str) -> DeliveryTarget:
 
 def ntfy_topic(name: str) -> DeliveryTarget:
     return DeliveryTarget(channel="ntfy", address=name)
+
+
+class LegacyProvider:
+    """适配旧 NotifierChannel：返回默认 target 使 router dispatch 不跳过。
+
+    各 feature 的 NotifierChannel 均以 `legacy_notifier` 名义注册，共享同一 provider。
+    """
+
+    def targets(self) -> list[DeliveryTarget]:
+        return [DeliveryTarget(channel="legacy_notifier", address="")]

@@ -1062,6 +1062,22 @@ class Storage:
             "failed": int(row["failed"] or 0),
         }
 
+    async def notification_event_key_exists(self, event_key: str) -> bool:
+        """是否已有归属该 event_key 的成功推送记录（跨链路去重）。
+
+        `event_keys` 为逗号拼接字符串；两侧补逗号后做 `,key,` 边界 LIKE，
+        避免裸子串匹配把同前缀 key 误判为命中。全 `?` 参数绑定。
+        """
+        if not event_key:
+            return False
+        row = await self._fetchone(
+            "SELECT 1 FROM notifications "
+            "WHERE status='success' AND ',' || COALESCE(event_keys, '') || ',' LIKE ? "
+            "LIMIT 1",
+            (f"%,{event_key},%",),
+        )
+        return row is not None
+
     # ---- 每日市场筛选（Market Screen）----
 
     @staticmethod

@@ -271,6 +271,11 @@ class Settings:
         return os.getenv("DAILY_BOT_TOKEN", "").strip()
 
     @property
+    def market_alert_bot_token(self) -> str:
+        """白名单市场告警独立 Bot token（MARKET_ALERT_BOT_TOKEN；空 = Telegram 禁用）。"""
+        return os.getenv("MARKET_ALERT_BOT_TOKEN", "").strip()
+
+    @property
     def daily_report(self) -> dict[str, Any]:
         """daily_report 配置节（日报调度与展示参数）。"""
         return self.section("daily_report")
@@ -790,4 +795,113 @@ def resolve_market_screen_config(settings: Settings) -> MarketScreenConfig:
         query_defaults=query_defaults,
         errors=errors,
         warnings=warnings,
+    )
+
+
+# ── 白名单市场告警（watchlist_alert）─────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class WatchlistRewardConfig:
+    """M1 奖励轮询告警子配置。"""
+
+    enabled: bool
+    interval_seconds: int = 900
+    alert_on_exit: bool = True
+    alert_on_floor_break: bool = True
+    alert_on_decay_pct: bool = True
+    decay_pct_threshold: float = 0.30
+    alert_on_tier_drop: bool = True
+    alert_on_rebound: bool = False
+    confirm_rounds: int = 1
+    cooldown_seconds: int = 86400
+
+
+@dataclass(frozen=True)
+class WatchlistTradeConfig:
+    """M2 清单市场成交推送子配置。"""
+
+    enabled: bool
+    merge_window_seconds: int = 30
+    max_events_per_message: int = 10
+    cross_link_dedup: bool = True
+
+
+@dataclass(frozen=True)
+class WatchlistAlertConfig:
+    """watchlist_alert 节解析结果（fail-soft，warnings 不阻断启动）。"""
+
+    enabled: bool
+    reward: WatchlistRewardConfig
+    trade: WatchlistTradeConfig
+    warnings: list[str] = field(default_factory=list)
+
+
+def _watch_int(raw: Any, key: str, default: int, lo: int, hi: int,
+               warnings: list[str], label: str) -> int:
+    value = _coerce_int(raw.get(key, default), default, warnings, label)
+    if value < lo or value > hi:
+        warnings.append(f"watchlist_alert.{label} 越界 [{lo},{hi}]，回退 {default}")
+        return default
+    return value
+
+
+def _watch_float(raw: Any, key: str, default: float, lo: float, hi: float,
+                 warnings: list[str], label: str, *, inclusive_hi: bool = True) -> float:
+    value = _coerce_float(raw.get(key, default), default, warnings, label)
+    in_range = value > lo if not inclusive_hi else value >= lo
+    if not in_range or value > hi:
+        warnings.append(f"watchlist_alert.{label} 越界 ({lo},{hi}]，回退 {default}")
+        return default
+    return value
+
+
+def resolve_watchlist_alert_config(settings: Settings) -> WatchlistAlertConfig:
+    """读取并校验 watchlist_alert 节；非法值回退默认并记 warnings，不抛异常。"""
+    raw = settings.section("watchlist_alert")
+    warnings: list[str] = []
+
+    enabled = bool(raw.get("enabled", True))
+    rw = raw.get("reward") if isinstance(raw.get("reward"), dict) else {}
+    tw = raw.get("trade") if isinstance(raw.get("trade"), dict) else {}
+
+    reward = WatchlistRewardConfig(
+        enabled=bool(rw.get("enabled", True)),
+        interval_seconds=_watch_int(
+            rw, "watch_interval_seconds", 900, 300, 1800, warnings,
+            "reward.watch_interval_seconds",
+        ),
+        alert_on_exit=bool(rw.get("alert_on_exit", True)),
+        alert_on_floor_break=bool(rw.get("alert_on_floor_break", True)),
+        alert_on_decay_pct=bool(rw.get("alert_on_decay_pct", True)),
+        decay_pct_threshold=_watch_float(
+            rw, "decay_pct_threshold", 0.30, 0.0, 1.0, warnings,
+            "reward.decay_pct_threshold",
+        ),
+        alert_on_tier_drop=bool(rw.get("alert_on_tier_drop", True)),
+        alert_on_rebound=bool(rw.get("alert_on_rebound", False)),
+        confirm_rounds=_watch_int(
+            rw, "confirm_rounds", 1, 1, 100, warnings, "reward.confirm_rounds"
+        ),
+        cooldown_seconds=_watch_int(
+            rw, "cooldown_seconds", 86400, 0, 86400 * 30, warnings,
+            "reward.cooldown_seconds",
+        ),
+    )
+
+    trade = WatchlistTradeConfig(
+        enabled=bool(tw.get("enabled", True)),
+        merge_window_seconds=_watch_int(
+            tw, "merge_window_seconds", 30, 5, 300, warnings,
+            "trade.merge_window_seconds",
+        ),
+        max_events_per_message=_watch_int(
+            tw, "max_events_per_message", 10, 1, 1000, warnings,
+            "trade.max_events_per_message",
+        ),
+        cross_link_dedup=bool(tw.get("cross_link_dedup", True)),
+    )
+
+    return WatchlistAlertConfig(
+        enabled=enabled, reward=reward, trade=trade, warnings=warnings,
     )

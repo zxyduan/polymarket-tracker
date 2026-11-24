@@ -13,14 +13,35 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from features.watchlist_alert.renderer import (
+    RewardChangeRenderer,
+    TradeAlertRenderer,
+)
+from features.watchlist_alert.usecase import (
+    RewardWatchUsecase,
+    TradeAlertUsecase,
+)
+from framework.adapters.notifier_channel import NotifierChannel
+from framework.delivery.router import ChannelRouter
+from framework.delivery.targets import LegacyProvider
+from framework.models.event import StandardEvent
+from framework.scheduler.guard import BodyHashGuard
+from framework.sources.reward_client import RewardMarketClient
+from framework.store.state_store import StateStore
 from src.bot.auth import AuthManager
 from src.bot.commands import CommandHandler
+from src.bot.market_alert_commands import MarketAlertCommandHandler
 from src.bot.telegram import BotRunner, TelegramApi
-from framework.models.event import StandardEvent
 from src.core.pipeline import PipelineRunner
 from src.core.renderer import AlertMessage
 from src.notify import Notifier, build_notifiers
-from src.settings import MarketEntry, Settings, resolve_daily_config, resolve_market_screen_config
+from src.settings import (
+    MarketEntry,
+    Settings,
+    resolve_daily_config,
+    resolve_market_screen_config,
+    resolve_watchlist_alert_config,
+)
 from src.snapshots.collector import SnapshotCollector
 from src.snapshots.commands import DailyCommandHandler, SnapshotCommandHandler
 from src.sources.data_api_client import DataApiClient
@@ -37,6 +58,7 @@ from framework.runtime.loops import (
     health_watcher,
     market_screen_loop,
     prune_loop,
+    reward_watch_loop,
     snapshot_collect_loop,
     snapshot_push_loop,
     supervised,
@@ -59,6 +81,8 @@ class AppHandle:
         self.snap_collector: SnapshotCollector | None = None
         self.pipeline: PipelineRunner | None = None
         self.ms_lister: GammaMarketLister | None = None
+        self.market_client: RewardMarketClient | None = None
+        self.trade_uc: TradeAlertUsecase | None = None
 
 
 async def build_app(config_path: str) -> AppHandle:
@@ -170,6 +194,13 @@ async def build_app(config_path: str) -> AppHandle:
             resolved_markets.append(m)
     if unresolved:
         logger.warning("以下市场未解析到 condition_id，日报将跳过: %s", ", ".join(unresolved))
+
+    # 白名单告警 cid 集合：跳过未解析到 cid 的空串条目并统一小写（T7 旁路匹配口径）。
+    watchlist_cids: set[str] = {
+        (m.condition_id or "").strip().lower()
+        for m in resolved_markets
+        if (m.condition_id or "").strip()
+    }
 
     snap_health: dict[str, Any] = {"snap_last_push": "-"}
     collect_state: dict[str, float] = {"round_done_ts": 0.0}
@@ -374,6 +405,98 @@ async def build_app(config_path: str) -> AppHandle:
     else:
         logger.info("market_screen 未启用或配置存在致命错误，任务不注册")
 
+    # ── 白名单市场告警（watchlist_market：M1 奖励轮询 + M2 清单成交）──
+    alert_cfg = resolve_watchlist_alert_config(settings)
+    for _warn in alert_cfg.warnings:
+        logger.warning("watchlist_alert 配置警告: %s", _warn)
+    market_health: dict[str, Any] = {}
+    market_alert_queue: asyncio.Queue[StandardEvent] | None = None
+    market_client: RewardMarketClient | None = None
+    trade_uc: TradeAlertUsecase | None = None
+    reward_uc: RewardWatchUsecase | None = None
+
+    if alert_cfg.enabled and watchlist_cids:
+        market_client = RewardMarketClient(
+            base_url=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
+            timeout_seconds=10,
+        )
+        market_store = StateStore(storage)
+        market_guard = BodyHashGuard(market_store)
+
+        mkt_api: TelegramApi | None = None
+        mkt_auth: AuthManager | None = None
+        if "telegram" in settings.notify_platforms and settings.market_alert_bot_token:
+            mkt_api = TelegramApi(settings.market_alert_bot_token)
+            mkt_auth = AuthManager([], storage, state_key="market_alert_allowed_chats")
+            await mkt_auth.load()
+            mkt_runner = BotRunner(mkt_api, storage, mkt_auth)
+            mkt_cmd = MarketAlertCommandHandler(storage, market_health)
+            tasks.append(asyncio.create_task(supervised(
+                "market_bot_updates",
+                lambda: mkt_runner.run_updates(mkt_cmd, stop_event),
+                stop_event)))
+            logger.info("白名单告警独立 Bot 已启用")
+
+        market_notifiers = build_notifiers(
+            settings, storage, mkt_api, mkt_auth, kind="watchlist_market"
+        )
+        market_router = ChannelRouter(
+            [NotifierChannel(n) for n in market_notifiers], LegacyProvider()
+        )
+        tz_off = int(snapshot_push_cfg.get("timezone_offset_hours", 8))
+        poly_base = str(endpoints.get("polygonscan", "https://polygonscan.com"))
+
+        if alert_cfg.trade.enabled:
+            market_alert_queue = asyncio.Queue(maxsize=1000)
+            pipeline.market_alert_queue = market_alert_queue
+            pipeline.watchlist_cids = watchlist_cids
+            trade_uc = TradeAlertUsecase(
+                renderer=TradeAlertRenderer(
+                    tz_offset_hours=tz_off, polygonscan_base=poly_base),
+                router=market_router, guard=market_guard,
+                config=alert_cfg.trade, health=market_health,
+                gamma=gamma, storage=storage,
+            )
+            h.trade_uc = trade_uc
+
+            async def _market_consumer(queue, stop) -> None:
+                while not stop.is_set():
+                    alert = await queue.get()
+                    try:
+                        if trade_uc is not None:
+                            await trade_uc.handle(alert)
+                    finally:
+                        queue.task_done()
+
+            tasks.append(asyncio.create_task(supervised(
+                "market_trade",
+                lambda: _market_consumer(market_alert_queue, stop_event),
+                stop_event)))
+
+        if alert_cfg.reward.enabled:
+            reward_uc = RewardWatchUsecase(
+                watcher=market_client, store=market_store,
+                renderer=RewardChangeRenderer(), router=market_router,
+                guard=market_guard, config=alert_cfg.reward,
+                health=market_health, gamma=gamma, storage=storage,
+                thresholds=ms_cfg,
+            )
+            tasks.append(asyncio.create_task(supervised(
+                "reward_watch",
+                lambda: reward_watch_loop(
+                    reward_uc, watchlist_cids, stop_event,
+                    interval_seconds=alert_cfg.reward.interval_seconds),
+                stop_event)))
+
+        h.market_client = market_client
+        logger.info(
+            "白名单告警已装配：清单 %d 个市场（奖励=%s 成交=%s，通道=%s）",
+            len(watchlist_cids), alert_cfg.reward.enabled, alert_cfg.trade.enabled,
+            [n.describe() for n in market_notifiers],
+        )
+    elif not watchlist_cids:
+        logger.warning("watchlist 清单为空，白名单告警不装配")
+
     # ── feature bootstrap（必须成功，失败直接 crash）──
     from framework.bootstrap import build_runtime
     from features.market_snapshot.renderer import SnapshotSummaryRenderer
@@ -441,6 +564,8 @@ async def shutdown_app(h: AppHandle) -> None:
     """收尾：等待发送完成 → 取消任务 → 关连接。"""
     if h.pipeline:
         await h.pipeline.shutdown()
+    if h.trade_uc:
+        await h.trade_uc.flush_all()
     await asyncio.sleep(1)
     for task in h.tasks:
         task.cancel()
@@ -449,6 +574,8 @@ async def shutdown_app(h: AppHandle) -> None:
         await h.snap_collector.aclose()
     if h.ms_lister:
         await h.ms_lister.aclose()
+    if h.market_client:
+        await h.market_client.aclose()
     if h.storage:
         await h.storage.close()
     logger.info("服务已停止")
