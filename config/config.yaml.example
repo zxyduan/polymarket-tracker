@@ -172,6 +172,7 @@ ntfy:
   topic: "polymarket-alerts"     # 交易员告警 topic（订阅端 App 需订阅同名 topic）
   snapshot_topic: "polymarket-snap"  # 快照总览 topic（缺省则用 topic）
   market_topic: "polymarket-watch"   # 白名单市场告警 topic（缺省则回退 topic）
+  price_topic: "polymarket-price"    # 价格突破告警 topic（缺省则回退 topic）
   access_token: ""               # 可选：私有 topic / 自建服务器鉴权（发布需 Bearer token）
   title_prefix: "market"     # 可选：推送标题前缀
   priority: ""                   # 可选：1-5（如 3=默认、4=高优先级）
@@ -209,4 +210,42 @@ watchlist_alert:
     merge_window_seconds: 30          # [5,300] 同市场合并窗口（秒）
     max_events_per_message: 10        # 单条消息最多笔数（≥1），达上限提前推送
     cross_link_dedup: true            # 跨链路重复成交抑制
+
+# ── 关键标的价格突破告警（price_watch）─────────────────────────────────────
+# 三类标的：crypto（Binance）/ stock（Stooq，不做交易时段判断）/
+# tokenized_stock（Coinbase on Base，DEX 池价，非正股）。阈值与标的全在此配置。
+price_watch:
+  enabled: true
+  watch_interval_seconds: 60          # [10,600] 全局轮询间隔（秒）
+  cooldown_seconds: 3600              # 同标的同事件冷却（秒，≥0）
+  # 注：单标的 interval_seconds 为预留字段，本期调度统一按全局 watch_interval_seconds。
+  symbols:
+    - symbol: BTCUSDT
+      label: BTC
+      category: crypto
+      enabled: true
+      interval_seconds: 60
+      price_above: 120000
+      price_below: 95000
+
+    - symbol: NVDA
+      label: 英伟达
+      category: stock
+      enabled: true
+      interval_seconds: 300
+      price_above: 220
+      price_below: 150
+
+    - symbol: NVDAc
+      label: 英伟达(链上代币)
+      category: tokenized_stock
+      issuer: coinbase
+      chain: base
+      contract: "0xb20000000000000000000078ee7ce2fe4908108c"
+      pool_address: ""               # 可选；缺省由聚合 API 解析最活跃池
+      price_kind: dex
+      enabled: true
+      interval_seconds: 60
+      price_above: 150
+      price_below: 120
 

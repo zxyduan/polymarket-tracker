@@ -23,7 +23,7 @@ from framework.models.watchlist_alert import MarketTradeAlert, RewardChangeEvent
 from framework.parsing.watchlist_parsing import (
     ParsedReward,
     diff_rewards,
-    parse_clob_reward,
+    parse_gamma_reward,
 )
 from framework.scheduler.guard import BodyHashGuard
 
@@ -87,7 +87,7 @@ class RewardWatchUsecase:
                 self._health.get("watch_fetch_failed", 0) + 1
             )
             return
-        cur = parse_clob_reward(
+        cur = parse_gamma_reward(
             raw,
             low_min=th.reward_tier_low_min,
             mid_min=th.reward_tier_mid_min,
@@ -97,11 +97,11 @@ class RewardWatchUsecase:
 
         base_key = f"reward_base:{cid}"
         base_raw = await self._store.get(_STATE_NS, base_key)
-        if base_raw is None:
-            # 冷启动只建基线，不产生告警。
+        prev = _load_base(base_raw) if base_raw is not None else None
+        if base_raw is None or _is_empty_reward(prev):
+            # 冷启动（含历史空基线污染）只建基线，不产生告警。
             await self._store.set(_STATE_NS, base_key, json.dumps(_base_dump(cur)))
             return
-        prev = _load_base(base_raw)
 
         events = diff_rewards(
             prev, cur, cid=cid,
@@ -370,4 +370,14 @@ def _load_base(base_raw: str) -> ParsedReward:
         start_date="",
         end_date=str(data.get("date") or ""),
         tier=data.get("tier"),
+    )
+
+
+def _is_empty_reward(reward: ParsedReward | None) -> bool:
+    """基线是否为全空（冷启动 / 历史空基线污染），可安全重建。"""
+    return reward is None or (
+        reward.rate is None
+        and not reward.asset
+        and reward.tier is None
+        and not reward.end_date
     )

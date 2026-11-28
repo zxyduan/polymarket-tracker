@@ -62,6 +62,12 @@ def _build_ntfy(
         topic = str(ntfy_cfg.get("market_topic", "")).strip() or str(
             ntfy_cfg.get("topic", "")
         ).strip()
+    elif kind == "price_watch":
+        # 关键标的价位告警专用 topic；缺省回退通用 topic，不回退 snapshot/daily/market 专用 topic
+        topic_key = "price_topic"
+        topic = str(ntfy_cfg.get("price_topic", "")).strip() or str(
+            ntfy_cfg.get("topic", "")
+        ).strip()
     elif kind == "snapshot":
         topic_key = "snapshot_topic"
         topic = str(ntfy_cfg.get(topic_key, "")).strip() or str(

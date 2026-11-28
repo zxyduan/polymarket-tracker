@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -904,4 +905,165 @@ def resolve_watchlist_alert_config(settings: Settings) -> WatchlistAlertConfig:
 
     return WatchlistAlertConfig(
         enabled=enabled, reward=reward, trade=trade, warnings=warnings,
+    )
+
+
+# ── 关键标的价格监控（price_watch）──────────────────────────────────────
+
+PRICE_CATEGORIES = ("crypto", "stock", "tokenized_stock")
+
+
+@dataclass(frozen=True)
+class PriceSymbolConfig:
+    """单个监控标的配置。"""
+
+    symbol: str
+    label: str
+    category: str
+    enabled: bool = True
+    interval_seconds: int | None = None      # 覆盖全局轮询间隔
+    price_above: float | None = None
+    price_below: float | None = None
+    issuer: str = "coinbase"
+    chain: str = "base"
+    contract: str = ""
+    pool_address: str = ""
+    price_kind: str = "dex"
+
+
+@dataclass(frozen=True)
+class PriceWatchConfig:
+    """price_watch 节解析结果（fail-soft，warnings 不阻断启动）。"""
+
+    enabled: bool
+    interval_seconds: int
+    cooldown_seconds: int
+    symbols: list[PriceSymbolConfig]
+    warnings: list[str] = field(default_factory=list)
+
+
+def _price_int(raw: Any, key: str, default: int, lo: int, hi: int,
+               warnings: list[str], label: str) -> int:
+    """整数配置解析 + 区间校验；非法 / 越界回退默认并记 warning。"""
+    try:
+        value = int(raw.get(key, default))
+    except (TypeError, ValueError):
+        warnings.append(f"price_watch.{label} 非法: {raw.get(key)!r}，回退 {default}")
+        return default
+    if value < lo or value > hi:
+        warnings.append(f"price_watch.{label} 越界 [{lo},{hi}]，回退 {default}")
+        return default
+    return value
+
+
+def _price_opt_int(raw: Any, key: str, warnings: list[str], label: str) -> int | None:
+    """可选整数（单标的间隔）；缺省返回 None，非法 / 越界回退 None（用全局间隔）。"""
+    if key not in raw or raw.get(key) is None:
+        return None
+    try:
+        value = int(raw.get(key))
+    except (TypeError, ValueError):
+        warnings.append(f"price_watch.{label} 非法: {raw.get(key)!r}，回退全局间隔")
+        return None
+    if value < 10 or value > 600:
+        warnings.append(f"price_watch.{label} 越界 [10,600]，回退全局间隔")
+        return None
+    return value
+
+
+def _price_threshold(
+    raw: Any, key: str, warnings: list[str], label: str
+) -> float | None:
+    """价格阈值解析；缺省 None，非法值 → warning + None。"""
+
+    if key not in raw or raw.get(key) is None:
+        return None
+    try:
+        value = float(raw.get(key))
+    except (TypeError, ValueError):
+        warnings.append(f"price_watch.{label} 非法: {raw.get(key)!r}，置空")
+        return None
+    if not math.isfinite(value) or value < 0:
+        warnings.append(f"price_watch.{label} 非有限正数: {value!r}，置空")
+        return None
+    return value
+
+
+def resolve_price_watch_config(settings: Settings) -> PriceWatchConfig:
+    """读取并校验 price_watch 节；非法值回退默认并记 warnings，不抛异常。"""
+    raw = settings.section("price_watch")
+    warnings: list[str] = []
+
+    enabled = bool(raw.get("enabled", True))
+    interval = _price_int(
+        raw, "watch_interval_seconds", 60, 10, 600, warnings,
+        "watch_interval_seconds",
+    )
+    cooldown = _price_int(
+        raw, "cooldown_seconds", 3600, 0, 86400 * 30, warnings,
+        "cooldown_seconds",
+    )
+
+    raw_symbols = raw.get("symbols")
+    symbols: list[PriceSymbolConfig] = []
+    if raw_symbols is None:
+        pass
+    elif not isinstance(raw_symbols, list):
+        warnings.append("price_watch.symbols 非列表，按空清单处理")
+    else:
+        for idx, item in enumerate(raw_symbols):
+            if not isinstance(item, dict):
+                warnings.append(f"price_watch.symbols[{idx}] 非对象，跳过")
+                continue
+            symbol = str(item.get("symbol", "")).strip()
+            category = str(item.get("category", "")).strip().lower()
+            if not symbol:
+                warnings.append(f"price_watch.symbols[{idx}] 缺 symbol，跳过")
+                continue
+            if category not in PRICE_CATEGORIES:
+                warnings.append(
+                    f"price_watch.symbols[{idx}].category 非法: {category!r}，跳过"
+                )
+                continue
+
+            above = _price_threshold(
+                item, "price_above", warnings, f"symbols[{idx}].price_above"
+            )
+            below = _price_threshold(
+                item, "price_below", warnings, f"symbols[{idx}].price_below"
+            )
+            if above is not None and below is not None and above <= below:
+                warnings.append(
+                    f"price_watch.symbols[{idx}] price_above <= price_below，跳过"
+                )
+                continue
+
+            if not bool(item.get("enabled", True)):
+                warnings.append(f"price_watch.symbols[{idx}] 已禁用，跳过")
+                continue
+
+            symbols.append(PriceSymbolConfig(
+                symbol=symbol,
+                label=str(item.get("label", "")).strip() or symbol,
+                category=category,
+                enabled=bool(item.get("enabled", True)),
+                interval_seconds=_price_opt_int(
+                    item, "interval_seconds", warnings,
+                    f"symbols[{idx}].interval_seconds",
+                ),
+                price_above=above,
+                price_below=below,
+                issuer=str(item.get("issuer", "coinbase")).strip() or "coinbase",
+                chain=str(item.get("chain", "base")).strip() or "base",
+                contract=str(item.get("contract", "")).strip(),
+                pool_address=str(item.get("pool_address", "")).strip(),
+                price_kind=str(item.get("price_kind", "dex")).strip() or "dex",
+            ))
+
+    return PriceWatchConfig(
+        enabled=enabled,
+        interval_seconds=interval,
+        cooldown_seconds=cooldown,
+        symbols=symbols,
+        warnings=warnings,
     )

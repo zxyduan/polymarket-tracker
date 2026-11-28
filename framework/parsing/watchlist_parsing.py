@@ -1,8 +1,7 @@
 """白名单市场奖励解析与两轮 diff 纯函数（T2）。
 
 无 IO、可单测；数值容错 / 代币映射 / 分档复用 `market_screen_parsing`。
-CLOB raw 结构（`rewards_config[]`）与 Gamma `clobRewards` 字段名不同，
-本模块按 raw 结构单独适配，不套 Gamma 解析。
+奖励段取自 Gamma 市场条目的 `clobRewards`（驼峰字段），本模块按该结构适配。
 """
 
 from __future__ import annotations
@@ -54,27 +53,27 @@ def _json_list(value: Any) -> list[Any] | None:
     return None
 
 
-def parse_clob_reward(
+def parse_gamma_reward(
     raw: dict[str, object],
     *,
     low_min: float,
     mid_min: float,
     high_min: float,
 ) -> ParsedReward | None:
-    """从 CLOB raw 的 `rewards_config[0]` 抽取；空 / 非 dict / 全脏值返回 None。"""
+    """从 Gamma 条目的 `clobRewards[0]` 抽取；空 / 非 dict / 全脏值返回 None。"""
     try:
-        entries = _json_list(raw.get("rewards_config"))
+        entries = _json_list(raw.get("clobRewards"))
         if not entries:
             return None
         first = entries[0]
         if not isinstance(first, dict):
             return None
 
-        rate = _to_float(first.get("rate_per_day"))
-        address = str(first.get("asset_address") or "").strip().lower()
+        rate = _to_float(first.get("rewardsDailyRate"))
+        address = str(first.get("assetAddress") or "").strip().lower()
         asset = _REWARD_ASSET_SYMBOLS.get(address, address) if address else ""
-        start_date = str(first.get("start_date") or "").strip()
-        end_date = str(first.get("end_date") or "").strip()
+        start_date = str(first.get("startDate") or "").strip()
+        end_date = str(first.get("endDate") or "").strip()
         if rate is None:
             # 条目存在但速率脏值 / 缺失：视为无有效奖励段。
             return None

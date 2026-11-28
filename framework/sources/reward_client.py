@@ -1,8 +1,10 @@
-"""CLOB 奖励段采集客户端（T3.2）。
+"""Gamma 奖励段采集客户端（T3.2）。
 
-只做协议翻译：GET `/rewards/markets/{cid}` 原始 dict，不解析速率 / 代币 / 分档
-（那些在 `framework/parsing/watchlist_parsing.py`）。429 优先按 `Retry-After`
-退避，5xx 指数退避重试；单市场失败隔离返回 None，不拖垮整轮。
+只做协议翻译：GET `/markets?condition_ids=<cid>` 原始市场条目，不解析速率 /
+代币 / 分档（那些在 `framework/parsing/watchlist_parsing.py`）。奖励段挂在条目
+的 `clobRewards` 字段下（Gamma 口径，驼峰）。注意 Gamma 的批量过滤参数是复数
+`condition_ids`；单数 `condition_id` 会被忽略、返回默认市场列表。429 优先按
+`Retry-After` 退避，5xx 指数退避；单市场失败隔离返回 None，不拖垮整轮。
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from src.utils.retry import backoff_delay
 
 logger = logging.getLogger(__name__)
 
-CLOB_BASE_URL = "https://clob.polymarket.com"
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
 
 class RewardFetchError(RuntimeError):
@@ -35,11 +37,11 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 class RewardMarketClient:
-    """按 condition_id 串行拉取 CLOB 奖励段原始 JSON。"""
+    """按 condition_id 串行拉取 Gamma 市场条目（含 clobRewards 奖励段）。"""
 
     def __init__(
         self,
-        base_url: str = CLOB_BASE_URL,
+        base_url: str = GAMMA_BASE_URL,
         *,
         timeout_seconds: int = 10,
         max_retries: int = 3,
@@ -55,14 +57,17 @@ class RewardMarketClient:
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
 
     async def get_reward(self, condition_id: str) -> dict[str, Any] | None:
-        """GET 单市场奖励段；失败 / 超时 / 4xx 隔离返回 None。"""
+        """GET 单市场 Gamma 条目；失败 / 超时 / 4xx 隔离返回 None。"""
         if not condition_id:
             return None
-        url = f"{self.base_url}/rewards/markets/{condition_id}"
+        target = condition_id.strip().lower()
         data: dict[str, Any] | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await self._client.get(url)
+                response = await self._client.get(
+                    f"{self.base_url}/markets",
+                    params={"condition_ids": condition_id},
+                )
             except Exception as exc:  # noqa: BLE001 - 网络 / 超时：隔离本轮该市场
                 logger.warning("奖励段请求失败 %s: %s", condition_id, exc)
                 if attempt == self.max_retries:
@@ -110,12 +115,16 @@ class RewardMarketClient:
             except ValueError:
                 logger.warning("奖励段响应非 JSON: %s", condition_id)
                 return None
-            if isinstance(payload, list):
-                data = {"rewards_config": payload}
-            elif isinstance(payload, dict):
-                data = payload
-            else:
-                data = None
+
+            items = payload if isinstance(payload, list) else payload.get("data", [])
+            if not isinstance(items, list):
+                items = []
+            for item in items:
+                if isinstance(item, dict) and str(
+                    item.get("conditionId") or ""
+                ).strip().lower() == target:
+                    data = item
+                    break
             break
 
         if self.request_interval > 0:

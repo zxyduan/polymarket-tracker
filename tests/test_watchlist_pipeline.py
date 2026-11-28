@@ -43,8 +43,8 @@ def _event(dedupe_key: str, cid: str) -> StandardEvent:
     return StandardEvent(
         dedupe_key=dedupe_key, source="rtds", wallet="0xwallet",
         event_type="TRADE", tx_hash="0xabc", condition_id=cid,
-        side="BUY", outcome="YES", price=Decimal("0.5"), size=Decimal("10"),
-        notional=Decimal("5"), event_time=datetime.now(timezone.utc),
+        side="BUY", outcome="YES", price=Decimal("0.5"), size=Decimal(10),
+        notional=Decimal(5), event_time=datetime.now(timezone.utc),
     )
 
 

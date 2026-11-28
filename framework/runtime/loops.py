@@ -359,6 +359,35 @@ async def reward_watch_loop(
         await watch_uc.run_round(cids)
 
 
+# ── 关键标的价位轮询 ──────────────────────────────────────────────────────
+
+
+async def price_watch_loop(
+    watch_uc: Any,
+    symbols: list[Any],
+    stop_event: asyncio.Event,
+    interval_seconds: int = 60,
+) -> None:
+    """固定间隔轮询关键标的价位；启动先跑一轮建基线，之后对齐整点桶。
+
+    循环体异常由 `supervised` 监护退避重启；loop 内不吞异常。
+    """
+    if not symbols:
+        logger.info("price_watch 清单为空，价位轮询循环退出")
+        return
+    await watch_uc.run_round(symbols)
+    while not stop_event.is_set():
+        now = int(time.time())
+        delay = interval_seconds - (now % interval_seconds)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay + 2)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        await watch_uc.run_round(symbols)
+
+
 # ── 任务监护 ────────────────────────────────────────────────────────────
 
 

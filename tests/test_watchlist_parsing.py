@@ -5,22 +5,22 @@ from __future__ import annotations
 from framework.parsing.watchlist_parsing import (
     ParsedReward,
     diff_rewards,
-    parse_clob_reward,
+    parse_gamma_reward,
 )
 
 USDC = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
-THRESH = dict(low_min=30.0, mid_min=100.0, high_min=300.0)
+THRESH: dict[str, float] = {"low_min": 30.0, "mid_min": 100.0, "high_min": 300.0}
 
 
 def _raw(rate: str | None, address: str = USDC) -> dict[str, object]:
     return {
-        "rewards_config": [
+        "clobRewards": [
             {
-                "rate_per_day": rate,
-                "asset_address": address,
-                "start_date": "2026-11-01",
-                "end_date": "2026-12-01",
+                "rewardsDailyRate": rate,
+                "assetAddress": address,
+                "startDate": "2026-11-01",
+                "endDate": "2026-12-01",
             }
         ]
     }
@@ -32,11 +32,11 @@ def _reward(rate: float | None, tier: str | None = None) -> ParsedReward:
     )
 
 
-# ── parse_clob_reward ────────────────────────────────────────────────────
+# ── parse_gamma_reward ────────────────────────────────────────────────────
 
 
 def test_parse_normal_reward_maps_asset_and_tier() -> None:
-    parsed = parse_clob_reward(_raw("120"), **THRESH)
+    parsed = parse_gamma_reward(_raw("120"), **THRESH)
     assert parsed is not None
     assert parsed.rate == 120.0
     assert parsed.asset == "USDC.e"
@@ -44,15 +44,15 @@ def test_parse_normal_reward_maps_asset_and_tier() -> None:
 
 
 def test_parse_empty_and_dirty_returns_none() -> None:
-    assert parse_clob_reward({}, **THRESH) is None
-    assert parse_clob_reward({"rewards_config": []}, **THRESH) is None
-    assert parse_clob_reward({"rewards_config": "not-a-list"}, **THRESH) is None
-    assert parse_clob_reward({"rewards_config": [123]}, **THRESH) is None
-    assert parse_clob_reward({"rewards_config": [{"rate_per_day": "abc"}]}, **THRESH) is None
+    assert parse_gamma_reward({}, **THRESH) is None
+    assert parse_gamma_reward({"clobRewards": []}, **THRESH) is None
+    assert parse_gamma_reward({"clobRewards": "not-a-list"}, **THRESH) is None
+    assert parse_gamma_reward({"clobRewards": [123]}, **THRESH) is None
+    assert parse_gamma_reward({"clobRewards": [{"rewardsDailyRate": "abc"}]}, **THRESH) is None
 
 
 def test_parse_unknown_address_keeps_lowercase_address() -> None:
-    parsed = parse_clob_reward(_raw("50", "0xdeadbeef"), **THRESH)
+    parsed = parse_gamma_reward(_raw("50", "0xdeadbeef"), **THRESH)
     assert parsed is not None
     assert parsed.asset == "0xdeadbeef"
 

@@ -21,12 +21,15 @@ from features.watchlist_alert.usecase import (
     RewardWatchUsecase,
     TradeAlertUsecase,
 )
+from features.price_watch.renderer import PriceAlertRenderer
+from features.price_watch.usecase import PriceWatchUsecase
 from framework.adapters.notifier_channel import NotifierChannel
 from framework.delivery.router import ChannelRouter
 from framework.delivery.targets import LegacyProvider
 from framework.models.event import StandardEvent
 from framework.scheduler.guard import BodyHashGuard
 from framework.sources.reward_client import RewardMarketClient
+from framework.sources.price_feed import PriceFeedClient
 from framework.store.state_store import StateStore
 from src.bot.auth import AuthManager
 from src.bot.commands import CommandHandler
@@ -40,6 +43,7 @@ from src.settings import (
     Settings,
     resolve_daily_config,
     resolve_market_screen_config,
+    resolve_price_watch_config,
     resolve_watchlist_alert_config,
 )
 from src.snapshots.collector import SnapshotCollector
@@ -57,6 +61,7 @@ from framework.runtime.loops import (
     heartbeat_writer,
     health_watcher,
     market_screen_loop,
+    price_watch_loop,
     prune_loop,
     reward_watch_loop,
     snapshot_collect_loop,
@@ -83,6 +88,8 @@ class AppHandle:
         self.ms_lister: GammaMarketLister | None = None
         self.market_client: RewardMarketClient | None = None
         self.trade_uc: TradeAlertUsecase | None = None
+        self.price_client: PriceFeedClient | None = None
+        self.price_uc: PriceWatchUsecase | None = None
 
 
 async def build_app(config_path: str) -> AppHandle:
@@ -417,7 +424,7 @@ async def build_app(config_path: str) -> AppHandle:
 
     if alert_cfg.enabled and watchlist_cids:
         market_client = RewardMarketClient(
-            base_url=str(endpoints.get("clob_api", "https://clob.polymarket.com")),
+            base_url=str(endpoints.get("gamma_api", "https://gamma-api.polymarket.com")),
             timeout_seconds=10,
         )
         market_store = StateStore(storage)
@@ -497,6 +504,53 @@ async def build_app(config_path: str) -> AppHandle:
     elif not watchlist_cids:
         logger.warning("watchlist 清单为空，白名单告警不装配")
 
+    # ── 关键标的价位告警（price_watch：加密 / 传统股票 / 代币化 DEX 池价）──
+    price_cfg = resolve_price_watch_config(settings)
+    for _warn in price_cfg.warnings:
+        logger.warning("price_watch 配置警告: %s", _warn)
+    price_health: dict[str, Any] = {}
+    price_client: PriceFeedClient | None = None
+    price_uc: PriceWatchUsecase | None = None
+
+    if price_cfg.enabled and price_cfg.symbols:
+        price_client = PriceFeedClient()
+        price_store = StateStore(storage)
+        price_guard = BodyHashGuard(price_store)
+        price_notifiers = build_notifiers(
+            settings, storage, None, None, kind="price_watch"
+        )
+        price_router = ChannelRouter(
+            [NotifierChannel(n) for n in price_notifiers], LegacyProvider()
+        )
+        price_uc = PriceWatchUsecase(
+            feed=price_client,
+            store=price_store,
+            renderer=PriceAlertRenderer(
+                tz_offset_hours=int(snapshot_push_cfg.get("timezone_offset_hours", 8))
+            ),
+            router=price_router,
+            guard=price_guard,
+            config=price_cfg,
+            health=price_health,
+        )
+        h.price_client = price_client
+        h.price_uc = price_uc
+        tasks.append(asyncio.create_task(supervised(
+            "price_watch",
+            lambda: price_watch_loop(
+                price_uc, price_cfg.symbols, stop_event,
+                interval_seconds=price_cfg.interval_seconds,
+            ),
+            stop_event,
+        )))
+        logger.info(
+            "price_watch 已装配：清单 %d 个标的（间隔=%ds，通道=%s）",
+            len(price_cfg.symbols), price_cfg.interval_seconds,
+            [n.describe() for n in price_notifiers],
+        )
+    else:
+        logger.info("price_watch 未启用或清单为空，价位告警不装配")
+
     # ── feature bootstrap（必须成功，失败直接 crash）──
     from framework.bootstrap import build_runtime
     from features.market_snapshot.renderer import SnapshotSummaryRenderer
@@ -566,6 +620,8 @@ async def shutdown_app(h: AppHandle) -> None:
         await h.pipeline.shutdown()
     if h.trade_uc:
         await h.trade_uc.flush_all()
+    if h.price_uc:
+        await h.price_uc.close()
     await asyncio.sleep(1)
     for task in h.tasks:
         task.cancel()
@@ -576,6 +632,8 @@ async def shutdown_app(h: AppHandle) -> None:
         await h.ms_lister.aclose()
     if h.market_client:
         await h.market_client.aclose()
+    if h.price_client:
+        await h.price_client.aclose()
     if h.storage:
         await h.storage.close()
     logger.info("服务已停止")

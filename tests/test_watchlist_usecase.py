@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -27,12 +28,12 @@ USDC = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
 def _raw(rate: str) -> dict[str, object]:
     return {
-        "rewards_config": [
+        "clobRewards": [
             {
-                "rate_per_day": rate,
-                "asset_address": USDC,
-                "start_date": "2026-11-01",
-                "end_date": "2026-12-01",
+                "rewardsDailyRate": rate,
+                "assetAddress": USDC,
+                "startDate": "2026-11-01",
+                "endDate": "2026-12-01",
             }
         ]
     }
@@ -165,7 +166,7 @@ async def test_m1_cold_start_only_builds_base(wired_storage: Storage) -> None:
 
 
 async def test_m1_exit_alert_routes_and_persists(wired_storage: Storage) -> None:
-    watcher = _Watcher([_raw("120"), {"rewards_config": []}])
+    watcher = _Watcher([_raw("120"), {"clobRewards": []}])
     guard = BodyHashGuard(StateStore(wired_storage))
     uc = RewardWatchUsecase(
         watcher=watcher, store=StateStore(wired_storage), renderer=_M1Renderer(),
@@ -179,7 +180,7 @@ async def test_m1_exit_alert_routes_and_persists(wired_storage: Storage) -> None
 
 
 async def test_m1_confirm_rounds_two_rounds(wired_storage: Storage) -> None:
-    watcher = _Watcher([_raw("120"), {"rewards_config": []}, {"rewards_config": []}])
+    watcher = _Watcher([_raw("120"), {"clobRewards": []}, {"clobRewards": []}])
     guard = BodyHashGuard(StateStore(wired_storage))
     uc = RewardWatchUsecase(
         watcher=watcher, store=StateStore(wired_storage), renderer=_M1Renderer(),
@@ -195,7 +196,7 @@ async def test_m1_confirm_rounds_two_rounds(wired_storage: Storage) -> None:
 
 
 async def test_m1_channel_failure_does_not_persist(wired_storage: Storage) -> None:
-    watcher = _Watcher([_raw("120"), {"rewards_config": []}])
+    watcher = _Watcher([_raw("120"), {"clobRewards": []}])
     guard = BodyHashGuard(StateStore(wired_storage))
     uc = RewardWatchUsecase(
         watcher=watcher, store=StateStore(wired_storage), renderer=_M1Renderer(),
@@ -210,7 +211,7 @@ async def test_m1_channel_failure_does_not_persist(wired_storage: Storage) -> No
 
 
 async def test_m1_render_none_counted(wired_storage: Storage) -> None:
-    watcher = _Watcher([_raw("120"), {"rewards_config": []}])
+    watcher = _Watcher([_raw("120"), {"clobRewards": []}])
     uc = RewardWatchUsecase(
         watcher=watcher, store=StateStore(wired_storage), renderer=_M1RendererNone(),
         router=ChannelRouter([_GoodChannel()], LegacyProvider()), guard=None,
@@ -220,6 +221,27 @@ async def test_m1_render_none_counted(wired_storage: Storage) -> None:
     await uc.run_round({"c1"})
     await uc.run_round({"c1"})
     assert uc.funnel["render_none"] == 1
+
+
+async def test_m1_stale_empty_base_is_rebuilt_not_rebound(wired_storage: Storage) -> None:
+    store = StateStore(wired_storage)
+    # 历史污染空基线（旧解析失败时落库）：首轮应重建基线，不误判 rebound 推送。
+    await store.set(
+        "watchlist_alert", "reward_base:c1",
+        json.dumps({"rate": None, "asset": "", "tier": None, "date": ""}),
+    )
+    watcher = _Watcher([_raw("120")])
+    guard = BodyHashGuard(store)
+    uc = RewardWatchUsecase(
+        watcher=watcher, store=store, renderer=_M1Renderer(),
+        router=ChannelRouter([_GoodChannel()], LegacyProvider()), guard=guard,
+        config=_reward_cfg(), health={}, gamma=_Gamma(), storage=wired_storage,
+        thresholds=_thresholds(),
+    )
+    await uc.run_round({"c1"})
+    assert uc.funnel.get("dispatched", 0) == 0
+    base = await store.get("watchlist_alert", "reward_base:c1")
+    assert json.loads(base)["rate"] == 120.0
 
 
 # ── M2 TradeAlertUsecase ────────────────────────────────────────────────
